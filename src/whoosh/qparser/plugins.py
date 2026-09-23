@@ -28,6 +28,13 @@
 import copy
 
 from whoosh import query
+from whoosh.analysis.synonyms import (
+    DEFAULT_MAX_PATHS,
+    SynonymPathLimitError,
+    is_graph_stream,
+    path_position_gap,
+    token_paths,
+)
 from whoosh.qparser import syntax
 from whoosh.qparser.common import attach
 from whoosh.qparser.taggers import FnTagger, RegexTagger
@@ -696,6 +703,46 @@ class PhrasePlugin(Plugin):
                 boost=self.boost,
             )
 
+        def _graph_query(self, parser, fieldname, tokens):
+            # Builds one phrase query per complete path through a synonym
+            # token graph, combined with Or, so mixes of alternative paths
+            # cannot match
+            sc = self.textstartchar
+            max_paths = getattr(parser, "max_synonym_paths", DEFAULT_MAX_PATHS)
+            try:
+                paths = token_paths(tokens, max_paths=max_paths)
+            except SynonymPathLimitError as e:
+                return query.error_query(str(e))
+
+            qclass = parser.phraseclass
+            subs = []
+            seen = set()
+            for path in paths:
+                words = tuple(t.text for t in path)
+                if not words or words in seen:
+                    continue
+                seen.add(words)
+                char_ranges = []
+                for t in path:
+                    startchar = getattr(t, "startchar", None)
+                    endchar = getattr(t, "endchar", None)
+                    if startchar is not None and endchar is not None:
+                        char_ranges.append((sc + startchar, sc + endchar))
+                    else:
+                        char_ranges.append((None, None))
+                slop = self.slop + path_position_gap(path)
+                subs.append(
+                    qclass(fieldname, list(words), slop=slop, char_ranges=char_ranges)
+                )
+
+            if not subs:
+                return query.NullQuery
+            if len(subs) == 1:
+                q = subs[0]
+                q.boost = self.boost
+                return q
+            return query.Or(subs, boost=self.boost)
+
         def query(self, parser):
             text = self.text
             fieldname = self.fieldname or parser.fieldname
@@ -709,7 +756,19 @@ class PhrasePlugin(Plugin):
                 if field.analyzer:
                     # We have a field with an analyzer, so use it to parse
                     # the phrase into tokens
-                    tokens = field.tokenize(text, mode="query", chars=True)
+                    tokens = [
+                        t.copy()
+                        for t in field.tokenize(
+                            text, mode="query", chars=True, positions=True
+                        )
+                    ]
+
+                    # If the analyzer emitted a synonym token graph, build
+                    # one phrase per complete token path
+                    if is_graph_stream(tokens):
+                        q = self._graph_query(parser, fieldname, tokens)
+                        return attach(q, self)
+
                     words = []
                     char_ranges = []
                     for t in tokens:

@@ -28,6 +28,13 @@
 import sys
 
 from whoosh import query
+from whoosh.analysis.synonyms import (
+    DEFAULT_MAX_PATHS,
+    SynonymPathLimitError,
+    is_graph_stream,
+    path_position_gap,
+    token_paths,
+)
 from whoosh.qparser import syntax
 from whoosh.qparser.common import QueryParserError, print_debug
 
@@ -86,6 +93,13 @@ class QueryParser:
         self.phraseclass = phraseclass
         self.group = group
         self.plugins = []
+
+        # The maximum number of token paths the parser will generate when
+        # expanding a synonym token graph (see
+        # whoosh.analysis.synonyms.SynonymGraphFilter). If a query would
+        # produce more paths than this, the parser returns a query with its
+        # ``error`` attribute set instead of silently dropping paths.
+        self.max_synonym_paths = DEFAULT_MAX_PATHS
 
         if plugins is None:
             plugins = self.default_set()
@@ -224,12 +238,25 @@ class QueryParser:
                     return query.error_query(e)
 
             # Otherwise, ask the field to process the text into a list of
-            # tokenized strings
-            texts = list(
-                field.process_text(
-                    text, mode="query", tokenize=tokenize, removestops=removestops
+            # tokens (copying them, since analyzers yield the same mutable
+            # Token object over and over)
+            tokens = [
+                t.copy()
+                for t in field.tokenize(
+                    text,
+                    mode="query",
+                    tokenize=tokenize,
+                    removestops=removestops,
+                    positions=True,
                 )
-            )
+            ]
+
+            # If the analyzer emitted a synonym token graph, expand it
+            # into one sub-query per complete token path
+            if is_graph_stream(tokens):
+                return self._graph_query(fieldname, tokens, termclass, boost)
+
+            texts = [t.text for t in tokens]
 
             # If the analyzer returned more than one token, use the field's
             # multitoken_query attribute to decide what query class, if any, to
@@ -246,6 +273,39 @@ class QueryParser:
             text = texts[0]
 
         return termclass(fieldname, text, boost=boost)
+
+    def _graph_query(self, fieldname, tokens, termclass, boost):
+        """Builds a query from a synonym token graph (see
+        :class:`whoosh.analysis.synonyms.SynonymGraphFilter`): one
+        sub-query per complete token path, combined with Or, so partial
+        mixes of alternative paths cannot match.
+        """
+
+        try:
+            paths = token_paths(tokens, max_paths=self.max_synonym_paths)
+        except SynonymPathLimitError as e:
+            return query.error_query(str(e))
+
+        subqueries = []
+        seen = set()
+        for path in paths:
+            words = tuple(t.text for t in path)
+            if not words or words in seen:
+                continue
+            seen.add(words)
+            if len(words) == 1:
+                subqueries.append(termclass(fieldname, words[0]))
+            else:
+                slop = 1 + path_position_gap(path)
+                subqueries.append(self.phraseclass(fieldname, list(words), slop=slop))
+
+        if not subqueries:
+            return None
+        if len(subqueries) == 1:
+            q = subqueries[0]
+            q.boost = boost
+            return q
+        return query.Or(subqueries, boost=boost)
 
     def taggers(self):
         """Returns a priorized list of tagger objects provided by the parser's

@@ -108,6 +108,14 @@ from whoosh.analysis.ngrams import (
     NgramTokenizer,
     NgramWordAnalyzer,
 )
+from whoosh.analysis.synonyms import (
+    DEFAULT_MAX_PATHS,
+    SynonymGraphFilter,
+    SynonymPathLimitError,
+    is_graph_stream,
+    path_position_gap,
+    token_paths,
+)
 from whoosh.analysis.tokenizers import (
     CharsetTokenizer,
     CommaSeparatedTokenizer,

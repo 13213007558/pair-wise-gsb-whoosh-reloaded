@@ -292,6 +292,41 @@ only the tokens whose ``stopped`` attribute is ``False``.
     attribute is ``True``.
 
 
+Synonyms
+--------
+
+The ``analysis.SynonymGraphFilter`` filter expands synonyms at query time,
+including multi-word synonyms, without rewriting the indexed terms (so you
+don't need to reindex existing data). Instead of crushing all alternatives
+into a bag of words at one position, it emits a token *graph*: tokens that
+take part in an expansion are tagged with ``pos``/``poslen`` spans (plus
+``synregion``/``synalt`` markers), and the query parser turns the graph
+into one sub-query per complete token path. For example, with the rule
+``nyc -> new york city``, a search for ``"visit nyc office"`` also matches
+``visit new york city office``, but a document containing the mixed
+fragment ``new city office`` does not match, because no complete path
+produces it.
+::
+
+    >>> from whoosh.analysis import (
+    ...     RegexTokenizer, LowercaseFilter, StopFilter, MultiFilter,
+    ...     SynonymGraphFilter,
+    ... )
+    >>> synonyms = {"nyc": "new york city", "new york city": "nyc"}
+    >>> analyzer = (RegexTokenizer() | LowercaseFilter() | StopFilter()
+    ...             | MultiFilter(query=SynonymGraphFilter(synonyms)))
+
+Rules may map one word to many, many words to one, or keep the original
+tokens as an additional path (``keep_orig=True``, the default). Matching is
+greedy and deterministic (longest left-hand side first), and expansions are
+never re-scanned, so rules cannot trigger each other recursively.
+
+If a query would expand to more token paths than the parser's
+``max_synonym_paths`` attribute (256 by default), the parser returns a query
+with its ``error`` attribute set instead of silently dropping candidates.
+
+
+
 Implementation notes
 --------------------
 
