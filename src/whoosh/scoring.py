@@ -63,6 +63,31 @@ class WeightingModel:
 
         raise NotImplementedError(self.__class__.__name__)
 
+    def explain(self, searcher, fieldname, text, matcher):
+        """Returns a JSON-serializable dict of scoring details for the
+        document the given matcher is currently positioned on, or None if
+        this weighting model does not support explanations.
+
+        This is the explanation protocol used by
+        :meth:`whoosh.searching.Searcher.explain`. Custom weighting models
+        can implement this method to provide a breakdown of how the score
+        for a term was computed. The default implementation returns None,
+        which causes the explanation tree to report the model as
+        unsupported.
+
+        :param searcher: the (possibly per-segment) searcher the matcher was
+            created from. Use ``searcher.get_parent()`` for global
+            statistics.
+        :param fieldname: the field name of the term being explained.
+        :param text: the (byte) text of the term being explained.
+        :param matcher: the raw postings matcher for the term, positioned on
+            the document being explained (any boost wrapper has been
+            removed).
+        :rtype: dict or None
+        """
+
+        return None
+
     def final(self, searcher, docnum, score):
         """Returns a final score for each document. You can use this method
         in subclasses to apply document-level adjustments to the score, for
@@ -309,6 +334,28 @@ class BM25F(WeightingModel):
             B = self.B
 
         return BM25FScorer(searcher, fieldname, text, B, self.K1, qf=qf)
+
+    def explain(self, searcher, fieldname, text, matcher):
+        if not searcher.schema[fieldname].scorable:
+            # The field doesn't store per-document field lengths, so the
+            # scorer falls back to returning the plain term weight
+            return {
+                "model": "BM25F",
+                "scorable": False,
+                "weight": matcher.weight(),
+            }
+
+        scorer = self.scorer(searcher, fieldname, text)
+        docid = matcher.id()
+        return {
+            "model": "BM25F",
+            "tf": matcher.weight(),
+            "field_length": searcher.doc_field_length(docid, fieldname, 1),
+            "avg_field_length": scorer.avgfl,
+            "idf": scorer.idf,
+            "B": scorer.B,
+            "K1": scorer.K1,
+        }
 
 
 class BM25FScorer(WeightLengthScorer):

@@ -144,6 +144,30 @@ A weighting model is a :class:`~ whoosh.scoring.WeightingModel` subclass with a
 ``scorer()`` method that produces a "scorer" instance. This instance has a
 method that takes the current matcher and returns a floating point score.
 
+Explaining scores
+-----------------
+
+To find out *why* a document received a particular score, use the
+:meth:`~whoosh.searching.Searcher.explain` method, which returns a
+JSON-serializable tree describing how the score was computed::
+
+    with myindex.searcher() as s:
+        results = s.search(myquery)
+        explanation = s.explain(myquery, results[0].docnum)
+
+The top-level ``score`` in the tree is computed by the same machinery used
+for searching, so it matches the score returned by ``search()`` on the same
+searcher. Leaf nodes list the actual statistics used by the weighting model
+(term frequency, field length, average field length, idf, and model
+parameters), and parent nodes describe how their children's scores were
+combined, so the contributions in the tree can be recomputed back into the
+final score.
+
+If the document doesn't match the query, was deleted, or is rejected by a
+filter, the explanation has ``matched`` set to ``False`` and a
+``reason`` key instead of a score. See the :mod:`whoosh.explain` module
+for a full description of the returned tree.
+
 Sorting
 -------
 

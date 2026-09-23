@@ -829,6 +829,41 @@ class Searcher:
         # Return the results object from the collector
         return c.results()
 
+    def explain(self, q, docnum, filter=None, mask=None):
+        """Returns a JSON-serializable tree explaining how the score of the
+        given document for the given query was computed by this searcher.
+
+        This is a read-only operation: it uses this searcher's current
+        statistics snapshot, so the explanation stays consistent with
+        searches performed on this searcher even if the index is updated
+        afterwards.
+
+        >>> with myindex.searcher() as s:
+        ...     results = s.search(myquery)
+        ...     explanation = s.explain(myquery, results[0].docnum)
+
+        The top-level `score` in the returned tree is computed by the same
+        matcher machinery used for searching, so it matches the score
+        returned by :meth:`search` on this searcher. See the
+        :mod:`whoosh.explain` module for a description of the returned
+        tree.
+
+        :param q: the :class:`whoosh.query.Query` object to explain.
+        :param docnum: the document number to explain, in this searcher's
+            (global) numbering, even when the index has multiple segments.
+        :param filter: only documents in this filter (a query, Results
+            object, or set of docnums) can be explained; if the document is
+            rejected by the filter, the explanation reports `"filtered"`
+            instead of a score.
+        :param mask: documents in this mask are rejected, as in
+            :meth:`search`.
+        :rtype: dict
+        """
+
+        from whoosh import explain
+
+        return explain.explain(self, q, docnum, filter=filter, mask=mask)
+
     def search_with_collector(self, q, collector, context=None):
         """Low-level method: runs a :class:`whoosh.query.Query` object on this
         searcher using the given :class:`whoosh.collectors.Collector` object
