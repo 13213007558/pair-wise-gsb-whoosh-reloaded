@@ -182,6 +182,18 @@ class FieldType:
         for tstring, freq, wt, vbytes in word_values(value, ana, **kwargs):
             yield (utf8encode(tstring)[0], freq, wt, vbytes)
 
+    def index_kwargs(self, fields, fieldname):
+        """
+        Returns a dictionary of extra keyword arguments to pass to this
+        field's index() method when indexing a document, based on the
+        keyword arguments that were passed to add_document(). The default
+        implementation returns an empty dictionary. Field types that need
+        per-document indexing options (such as MultiLangTEXT) can override
+        this to pull values out of the fields dictionary.
+        """
+
+        return {}
+
     def tokenize(self, value, **kwargs):
         """
         Analyzes the given string and returns an iterator of Token objects
@@ -1191,6 +1203,425 @@ class TEXT(FieldType):
             return self.spelling_prefix + fieldname
         else:
             return fieldname
+
+
+class MultiLangTEXT(TEXT):
+    """
+    A text field that indexes each document through one of several
+    language-specific analysis chains, chosen explicitly per document at
+    index time. This lets a single field hold, for example, both Chinese and
+    English documents without forcing all content through the same analyzer.
+
+    Every indexed term is tagged with the language of the analysis chain
+    that produced it, so identical token text produced by different
+    languages never collides in the index. At query time you select a set of
+    languages and the field builds one query branch per language, each using
+    that language's analysis chain.
+
+    The field never guesses the language of a document from its content. If
+    a document does not specify a language, the field's configured
+    default_lang is used; how an explicitly specified but unconfigured
+    language is handled is decided by the on_unknown setting.
+
+    Example:
+
+        from whoosh import analysis, fields
+
+        analysis.register_analyzer(
+            "en_std", analysis.StandardAnalyzer(), version=1
+        )
+        analysis.register_analyzer(
+            "zh_bigram", analysis.NgramTokenizer(2), version=1
+        )
+
+        schema = fields.Schema(
+            id=fields.ID(stored=True, unique=True),
+            content=fields.MultiLangTEXT(
+                {"en": "en_std", "zh": "zh_bigram"},
+                default_lang="en",
+                stored=True,
+            ),
+        )
+
+        ix = RamStorage().create_index(schema)
+        writer = ix.writer()
+        writer.add_document(id="1", content="the quick brown fox",
+                            _lang_content="en")
+        writer.add_document(id="2", content="\u5317\u4eac\u4e0a\u6d77",
+                            _lang_content="zh")
+        writer.commit()
+
+        field = schema["content"]
+        with ix.searcher() as s:
+            # One branch per selected language
+            q = field.query("content", "quick", langs=["en"])
+            print([hit["id"] for hit in s.search(q)])
+
+    The per-document language is passed to add_document()/update_document()
+    using a keyword argument of the form _lang_<fieldname>. Documents added
+    without it are indexed with default_lang.
+
+    The analyzers may be given as analyzer objects or as names registered
+    with whoosh.analysis.register_analyzer(). For registered names, the
+    registration version is stored in the index configuration; when the
+    index is opened and the registered analyzer is missing or has a
+    different version, a FieldConfigurationError is raised with a message
+    explaining the mismatch.
+
+    Note: this field type does not support term vectors, spelling, or
+    character-position (pinpoint) highlighting. Highlighting re-tokenizes
+    the stored text using the analysis chain of the branch that matched.
+    """
+
+    # Separates the language tag from the token text in indexed terms
+    SEPARATOR = "\x01"
+
+    def __init__(
+        self,
+        analyzers,
+        default_lang=None,
+        on_unknown="default",
+        phrase=True,
+        stored=False,
+        field_boost=1.0,
+        multitoken_query="default",
+        sortable=False,
+    ):
+        """
+        :param analyzers: a dictionary mapping language names to
+            analysis.Analyzer objects, or to names registered with
+            analysis.register_analyzer(). Registered names are resolved at
+            construction time and their registration versions are stored in
+            the index configuration.
+        :param default_lang: the language used for documents that do not
+            explicitly specify one. Must be one of the configured languages.
+            If omitted, the alphabetically first configured language is used.
+        :param on_unknown: what to do when a document specifies a language
+            that is not configured: "default" indexes the document with
+            default_lang, "error" raises FieldConfigurationError, and any
+            configured language name indexes the document with that language.
+        :param phrase: whether to store positional information to allow
+            phrase searching.
+        :param stored: whether to store the original text of this field with
+            the document, for example to allow highlighting.
+        :param field_boost: a boost factor applied to all terms in this
+            field.
+        :param multitoken_query: how to combine multiple tokens produced by
+            analyzing a single query word: "first", "and", "or", "phrase",
+            or "default" (all tokens required, like the default query
+            parser).
+        :param sortable: if True, make this field sortable using the default
+            column type.
+        """
+
+        if not analyzers:
+            raise FieldConfigurationError(
+                "MultiLangTEXT requires at least one language analyzer"
+            )
+
+        resolved = {}
+        registry_info = {}
+        for lang, spec in analyzers.items():
+            if not isinstance(lang, str) or not lang:
+                raise FieldConfigurationError(
+                    f"Language names must be non-empty strings, got {lang!r}"
+                )
+            if self.SEPARATOR in lang:
+                raise FieldConfigurationError(
+                    f"Language name {lang!r} may not contain the separator"
+                )
+            if isinstance(spec, str):
+                if not analysis.is_registered(spec):
+                    raise FieldConfigurationError(
+                        f"No analyzer is registered under the name {spec!r} "
+                        f"(language {lang!r})"
+                    )
+                registry_info[lang] = (spec, analysis.registered_version(spec))
+                resolved[lang] = analysis.registered_analyzer(spec)
+            else:
+                registry_info[lang] = (None, None)
+                resolved[lang] = spec
+
+        if default_lang is None:
+            default_lang = sorted(resolved)[0]
+        if default_lang not in resolved:
+            raise FieldConfigurationError(
+                f"default_lang {default_lang!r} is not one of the configured "
+                f"languages {sorted(resolved)!r}"
+            )
+        if on_unknown not in ("default", "error") and on_unknown not in resolved:
+            raise FieldConfigurationError(
+                f"on_unknown must be 'default', 'error', or one of the "
+                f"configured languages {sorted(resolved)!r}, "
+                f"got {on_unknown!r}"
+            )
+
+        self.analyzers = resolved
+        self.default_lang = default_lang
+        self.on_unknown = on_unknown
+        self._registry_info = registry_info
+
+        super().__init__(
+            analyzer=resolved[default_lang],
+            phrase=phrase,
+            chars=False,
+            stored=stored,
+            field_boost=field_boost,
+            multitoken_query=multitoken_query,
+            spelling=False,
+            sortable=sortable,
+            vector=None,
+        )
+
+    def __eq__(self, other):
+        return (
+            super().__eq__(other)
+            and isinstance(other, MultiLangTEXT)
+            and self.analyzers == other.analyzers
+            and self.default_lang == other.default_lang
+            and self.on_unknown == other.on_unknown
+        )
+
+    def __ne__(self, other):
+        return not self.__eq__(other)
+
+    def __setstate__(self, state):
+        self.__dict__.update(state)
+        self._check_analyzer_registry()
+
+    def _check_analyzer_registry(self):
+        # The names/versions of registered analyzers are part of the index
+        # configuration. When the index is opened (the schema is unpickled),
+        # verify the environment still provides the same analyzer versions
+        # instead of silently tokenizing differently.
+        for lang, (name, version) in self._registry_info.items():
+            if name is None:
+                continue
+            if not analysis.is_registered(name):
+                raise FieldConfigurationError(
+                    f"Cannot open index: language {lang!r} requires analyzer "
+                    f"{name!r}, but no analyzer is registered under that name"
+                )
+            current = analysis.registered_version(name)
+            if current != version:
+                raise FieldConfigurationError(
+                    f"Cannot open index: analyzer {name!r} for language "
+                    f"{lang!r} has registered version {current!r}, but the "
+                    f"index was built with version {version!r}"
+                )
+
+    # Languages
+
+    def _resolve_lang(self, lang):
+        if lang is None:
+            return self.default_lang
+        if lang in self.analyzers:
+            return lang
+        if self.on_unknown == "error":
+            raise FieldConfigurationError(
+                f"Language {lang!r} is not configured for this field; "
+                f"configured languages are {sorted(self.analyzers)!r}"
+            )
+        if self.on_unknown == "default":
+            return self.default_lang
+        return self.on_unknown
+
+    def _query_langs(self, langs):
+        if langs is None:
+            return sorted(self.analyzers)
+        langs = list(langs)
+        for lang in langs:
+            if lang not in self.analyzers:
+                raise FieldConfigurationError(
+                    f"Language {lang!r} is not configured for this field; "
+                    f"configured languages are {sorted(self.analyzers)!r}"
+                )
+        return langs
+
+    def _prefixed(self, lang, text):
+        return lang + self.SEPARATOR + text
+
+    def lang_of_bytes(self, btext):
+        """
+        Returns the language tag of an indexed term in this field, or None
+        if the term does not carry a configured language tag.
+        """
+
+        text = utf8decode(btext)[0]
+        lang, sep, _ = text.partition(self.SEPARATOR)
+        if sep and lang in self.analyzers:
+            return lang
+        return None
+
+    # Indexing
+
+    def index_kwargs(self, fields, fieldname):
+        return {"lang": fields.get(f"_lang_{fieldname}")}
+
+    def index(self, value, lang=None, **kwargs):
+        if not self.format:
+            raise Exception(
+                "%s field %r cannot index without a format"
+                % (self.__class__.__name__, self)
+            )
+        if not isinstance(value, (str, list, tuple)):
+            raise ValueError(f"{value!r} is not unicode or sequence")
+
+        lang = self._resolve_lang(lang)
+        ana = self.analyzers[lang]
+        prefix = lang + self.SEPARATOR
+        word_values = self.format.word_values
+        for tstring, freq, wt, vbytes in word_values(value, ana, mode="index"):
+            yield (utf8encode(prefix + tstring)[0], freq, wt, vbytes)
+
+    # Conversion
+
+    def from_bytes(self, bs):
+        # Strip the language tag so consumers (for example highlighting) see
+        # the plain token text
+        text = utf8decode(bs)[0]
+        lang, sep, rest = text.partition(self.SEPARATOR)
+        if sep and lang in self.analyzers:
+            return rest
+        return text
+
+    def supports(self, name):
+        if name == "characters":
+            # Pinpoint highlighting cannot map language-tagged terms back to
+            # the query's plain terms; highlighting re-tokenizes instead
+            return False
+        return super().supports(name)
+
+    # Queries
+
+    def _analyze(self, lang, qstring, **kwargs):
+        ana = self.analyzers[lang]
+        return [t.text for t in ana(qstring, mode="query", **kwargs)]
+
+    @staticmethod
+    def _join_branches(branches):
+        from whoosh import query
+
+        branches = [branch for branch in branches if branch is not None]
+        if not branches:
+            return query.NullQuery
+        if len(branches) == 1:
+            return branches[0]
+        return query.Or(branches)
+
+    def _branch_query(self, fieldname, qstring, lang, boost=1.0):
+        from whoosh import query
+
+        texts = self._analyze(lang, qstring)
+        if not texts:
+            return None
+        prefixed = [self._prefixed(lang, text) for text in texts]
+        if len(prefixed) == 1:
+            return query.Term(fieldname, prefixed[0], boost=boost)
+
+        spec = self.multitoken_query
+        if spec == "first":
+            return query.Term(fieldname, prefixed[0], boost=boost)
+        elif spec == "phrase":
+            return query.Phrase(fieldname, prefixed, boost=boost)
+        elif spec in ("and", "default"):
+            qclass = query.And
+        elif spec == "or":
+            qclass = query.Or
+        else:
+            raise FieldConfigurationError(
+                f"Unknown multitoken_query value {spec!r}"
+            )
+        return qclass([query.Term(fieldname, t, boost=boost) for t in prefixed])
+
+    def query(self, fieldname, qstring, langs=None, boost=1.0):
+        """
+        Returns a query for the given text, with one branch per language in
+        langs, each branch using that language's analysis chain. If langs is
+        None, all configured languages are searched.
+        """
+
+        return self._join_branches(
+            self._branch_query(fieldname, qstring, lang, boost=boost)
+            for lang in self._query_langs(langs)
+        )
+
+    def term(self, fieldname, text, lang, boost=1.0):
+        """
+        Returns a query for a single word in a single language, analyzed
+        with that language's analysis chain.
+        """
+
+        q = self._branch_query(fieldname, text, lang, boost=boost)
+        if q is None:
+            from whoosh import query
+
+            return query.NullQuery
+        return q
+
+    def phrase(self, fieldname, qstring, langs=None, slop=1, boost=1.0):
+        """
+        Returns a phrase query for the given text, with one branch per
+        language in langs, each branch analyzed with that language's
+        analysis chain. If langs is None, all configured languages are
+        searched.
+        """
+
+        from whoosh import query
+
+        branches = []
+        for lang in self._query_langs(langs):
+            texts = self._analyze(lang, qstring)
+            if not texts:
+                continue
+            prefixed = [self._prefixed(lang, text) for text in texts]
+            if len(prefixed) == 1:
+                branches.append(query.Term(fieldname, prefixed[0], boost=boost))
+            else:
+                branches.append(
+                    query.Phrase(fieldname, prefixed, slop=slop, boost=boost)
+                )
+        return self._join_branches(branches)
+
+    def prefix(self, fieldname, qtext, langs=None, boost=1.0):
+        """
+        Returns a prefix query for the given text, with one branch per
+        language in langs. The prefix text is run through each language's
+        analysis chain and the last resulting token is used as the prefix
+        (if analysis produces no tokens, the raw text is used). If langs is
+        None, all configured languages are searched.
+        """
+
+        from whoosh import query
+
+        branches = []
+        for lang in self._query_langs(langs):
+            texts = self._analyze(lang, qtext, removestops=False)
+            prefix_text = texts[-1] if texts else qtext
+            branches.append(
+                query.Prefix(
+                    fieldname, self._prefixed(lang, prefix_text), boost=boost
+                )
+            )
+        return self._join_branches(branches)
+
+    # Highlighting
+
+    def highlight_analyzer(self, hitobj, fieldname):
+        """
+        Returns the analysis chain of the branch that matched the given hit,
+        used to re-tokenize stored text for highlighting. Falls back to the
+        default language's analyzer when the matched branch cannot be
+        determined.
+        """
+
+        lang = None
+        for fname, btext in hitobj.matched_terms() or ():
+            if fname == fieldname:
+                lang = self.lang_of_bytes(btext)
+                if lang is not None:
+                    break
+        return self.analyzers[lang or self.default_lang]
 
 
 class SpellField(FieldType):

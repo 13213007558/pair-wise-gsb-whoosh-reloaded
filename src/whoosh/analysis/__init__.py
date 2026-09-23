@@ -108,6 +108,14 @@ from whoosh.analysis.ngrams import (
     NgramTokenizer,
     NgramWordAnalyzer,
 )
+from whoosh.analysis.registry import (
+    clear_registry,
+    is_registered,
+    register_analyzer,
+    registered_analyzer,
+    registered_version,
+    unregister_analyzer,
+)
 from whoosh.analysis.tokenizers import (
     CharsetTokenizer,
     CommaSeparatedTokenizer,

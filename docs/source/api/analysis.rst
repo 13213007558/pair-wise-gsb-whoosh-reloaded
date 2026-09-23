@@ -59,3 +59,14 @@ Token classes and functions
 
 .. autoclass:: Token
 .. autofunction:: unstopped
+
+
+Analyzer registry
+=================
+
+.. autofunction:: register_analyzer
+.. autofunction:: unregister_analyzer
+.. autofunction:: is_registered
+.. autofunction:: registered_analyzer
+.. autofunction:: registered_version
+.. autofunction:: clear_registry

@@ -1098,7 +1098,11 @@ class Highlighter:
             fragments = self.fragmenter.fragment_matches(text, tokens)
         else:
             # Retokenize the text
-            analyzer = results.searcher.schema[fieldname].analyzer
+            highlight_analyzer = getattr(field, "highlight_analyzer", None)
+            if highlight_analyzer is not None:
+                analyzer = highlight_analyzer(hitobj, fieldname)
+            else:
+                analyzer = field.analyzer
             tokens = analyzer(
                 text, positions=True, chars=True, mode="index", removestops=False
             )

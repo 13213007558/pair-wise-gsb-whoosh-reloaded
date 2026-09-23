@@ -773,7 +773,7 @@ class SegmentWriter(IndexWriter):
                     fieldboost = self._field_boost(fields, fieldname, docboost)
                     # Ask the field to return a list of (text, weight, vbytes)
                     # tuples
-                    items = field.index(value)
+                    items = field.index(value, **field.index_kwargs(fields, fieldname))
                     # Only store the length if the field is marked scorable
                     scorable = field.scorable
                     # Add the terms to the pool
