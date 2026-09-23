@@ -43,9 +43,11 @@ For example, to find documents containing "whoosh" at most 5 positions before
 
 """
 
+from bisect import bisect_right
+
 from whoosh.matching import binary, mcore, wrappers
 from whoosh.query.compound import And, AndMaybe, Or
-from whoosh.query.qcore import Query
+from whoosh.query.qcore import Query, QueryError
 from whoosh.query.terms import Term
 from whoosh.util import make_binary_tree
 
@@ -185,6 +187,81 @@ def bisect_spans(spans, start):
         else:
             hi = mid
     return lo
+
+
+# Multi-value field support
+
+
+def crosses_value_boundary(start, end, boundaries):
+    """Returns True if the position range ``start``-``end`` (inclusive)
+    crosses a value boundary of a multi-value field. ``boundaries`` is a
+    sorted list of the positions at which a new value starts.
+    """
+
+    i = bisect_right(boundaries, start)
+    return i < len(boundaries) and boundaries[i] <= end
+
+
+def matcher_value_boundaries(m, _depth=0):
+    """Returns the value boundary positions for the current document of the
+    given matcher (by asking the matcher and its children), or None if the
+    field does not store value boundary information.
+    """
+
+    boundaries = m.value_boundaries()
+    if boundaries:
+        return boundaries
+    if _depth < 8:
+        for child in m.children():
+            boundaries = matcher_value_boundaries(child, _depth + 1)
+            if boundaries:
+                return boundaries
+    return None
+
+
+def resolve_value_boundaries(searcher, fieldname, respect=None):
+    """Decides whether span matching on the given field should enforce
+    multi-value boundaries.
+
+    :param searcher: the searcher the query will run on.
+    :param fieldname: the name of the field being matched, or None.
+    :param respect: True to require boundary enforcement, False to disable
+        it, or None to use the field's configured behavior.
+    """
+
+    if not fieldname or fieldname not in searcher.schema:
+        if respect:
+            raise QueryError(
+                f"Field {fieldname!r} does not store multi-value position "
+                "boundaries; rebuild the index with a MULTITEXT field to use "
+                "value-boundary-aware queries"
+            )
+        return False
+
+    field = searcher.schema[fieldname]
+    fmt = getattr(field, "format", None)
+    supported = fmt is not None and fmt.supports("value_boundaries")
+
+    if respect is None:
+        respect = bool(getattr(fmt, "enforce_value_boundaries", False))
+
+    if respect and not supported:
+        raise QueryError(
+            f"Field {fieldname!r} does not store multi-value position "
+            "boundaries; rebuild the index with a MULTITEXT field to use "
+            "value-boundary-aware queries"
+        )
+    return respect
+
+
+def first_fieldname(qs):
+    """Returns the field name of the first query in the list that has one."""
+
+    for q in qs:
+        fieldname = getattr(q, "fieldname", None)
+        if fieldname:
+            return fieldname
+    return None
 
 
 # Base matchers
@@ -387,7 +464,7 @@ class SpanNear(SpanQuery):
                                   slop=2)
     """
 
-    def __init__(self, a, b, slop=1, ordered=True, mindist=1):
+    def __init__(self, a, b, slop=1, ordered=True, mindist=1, respect_boundaries=None):
         """
         :param a: the first query to match.
         :param b: the second query that must occur within "slop" positions of
@@ -397,6 +474,9 @@ class SpanNear(SpanQuery):
             to each other.
         :param ordered: whether a must occur before b. Default is True.
         :pram mindist: the minimum distance allowed between the queries.
+        :param respect_boundaries: if True, matches may never cross the
+            boundaries between the values of a multi-value field. If None
+            (the default), the field's own configuration decides.
         """
 
         self.q = And([a, b])
@@ -405,6 +485,7 @@ class SpanNear(SpanQuery):
         self.slop = slop
         self.ordered = ordered
         self.mindist = mindist
+        self.respect_boundaries = respect_boundaries
 
     def __repr__(self):
         return "%s(%r, slop=%d, ordered=%s, mindist=%d)" % (
@@ -423,6 +504,7 @@ class SpanNear(SpanQuery):
             and self.slop == other.slop
             and self.ordered == other.ordered
             and self.mindist == other.mindist
+            and self.respect_boundaries == other.respect_boundaries
         )
 
     def __hash__(self):
@@ -432,6 +514,7 @@ class SpanNear(SpanQuery):
             ^ hash(self.slop)
             ^ hash(self.ordered)
             ^ hash(self.mindist)
+            ^ hash(self.respect_boundaries)
         )
 
     def is_leaf(self):
@@ -444,13 +527,22 @@ class SpanNear(SpanQuery):
             slop=self.slop,
             ordered=self.ordered,
             mindist=self.mindist,
+            respect_boundaries=self.respect_boundaries,
         )
 
     def matcher(self, searcher, context=None):
         ma = self.a.matcher(searcher, context)
         mb = self.b.matcher(searcher, context)
+        enforce = resolve_value_boundaries(
+            searcher, first_fieldname([self.a, self.b]), self.respect_boundaries
+        )
         return SpanNear.SpanNearMatcher(
-            ma, mb, slop=self.slop, ordered=self.ordered, mindist=self.mindist
+            ma,
+            mb,
+            slop=self.slop,
+            ordered=self.ordered,
+            mindist=self.mindist,
+            respect_boundaries=enforce,
         )
 
     @classmethod
@@ -474,12 +566,15 @@ class SpanNear(SpanQuery):
         return make_binary_tree(cls, terms, slop=slop, ordered=ordered)
 
     class SpanNearMatcher(SpanWrappingMatcher):
-        def __init__(self, a, b, slop=1, ordered=True, mindist=1):
+        def __init__(
+            self, a, b, slop=1, ordered=True, mindist=1, respect_boundaries=False
+        ):
             self.a = a
             self.b = b
             self.slop = slop
             self.ordered = ordered
             self.mindist = mindist
+            self.respect_boundaries = respect_boundaries
             isect = binary.IntersectionMatcher(a, b)
             super().__init__(isect)
 
@@ -490,6 +585,7 @@ class SpanNear(SpanQuery):
                 slop=self.slop,
                 ordered=self.ordered,
                 mindist=self.mindist,
+                respect_boundaries=self.respect_boundaries,
             )
 
         def replace(self, minquality=0):
@@ -524,7 +620,22 @@ class SpanNear(SpanQuery):
                     if mindist <= dist <= slop:
                         spans.add(aspan.to(bspan))
 
-            return sorted(spans)
+            spans = sorted(spans)
+            if self.respect_boundaries and spans:
+                spans = self._filter_boundaries(spans)
+            return spans
+
+        def _filter_boundaries(self, spans):
+            boundaries = matcher_value_boundaries(self.a) or matcher_value_boundaries(
+                self.b
+            )
+            if boundaries:
+                spans = [
+                    span
+                    for span in spans
+                    if not crosses_value_boundary(span.start, span.end, boundaries)
+                ]
+            return spans
 
 
 class SpanNear2(SpanQuery):
@@ -558,7 +669,7 @@ class SpanNear2(SpanQuery):
         q = spans.SpanNear2(t1, t2, slop=5, ordered=False)
     """
 
-    def __init__(self, qs, slop=1, ordered=True, mindist=1):
+    def __init__(self, qs, slop=1, ordered=True, mindist=1, respect_boundaries=None):
         """
         :param qs: a sequence of sub-queries to match.
         :param slop: the number of positions within which the queries must
@@ -566,12 +677,16 @@ class SpanNear2(SpanQuery):
             to each other.
         :param ordered: whether a must occur before b. Default is True.
         :pram mindist: the minimum distance allowed between the queries.
+        :param respect_boundaries: if True, matches may never cross the
+            boundaries between the values of a multi-value field. If None
+            (the default), the field's own configuration decides.
         """
 
         self.qs = qs
         self.slop = slop
         self.ordered = ordered
         self.mindist = mindist
+        self.respect_boundaries = respect_boundaries
 
     def __repr__(self):
         return "%s(%r, slop=%d, ordered=%s, mindist=%d)" % (
@@ -590,10 +705,16 @@ class SpanNear2(SpanQuery):
             and self.slop == other.slop
             and self.ordered == other.ordered
             and self.mindist == other.mindist
+            and self.respect_boundaries == other.respect_boundaries
         )
 
     def __hash__(self):
-        h = hash(self.slop) ^ hash(self.ordered) ^ hash(self.mindist)
+        h = (
+            hash(self.slop)
+            ^ hash(self.ordered)
+            ^ hash(self.mindist)
+            ^ hash(self.respect_boundaries)
+        )
         for q in self.qs:
             h ^= hash(q)
         return h
@@ -619,20 +740,31 @@ class SpanNear2(SpanQuery):
             slop=self.slop,
             ordered=self.ordered,
             mindist=self.mindist,
+            respect_boundaries=self.respect_boundaries,
         )
 
     def matcher(self, searcher, context=None):
         ms = [q.matcher(searcher, context) for q in self.qs]
+        enforce = resolve_value_boundaries(
+            searcher, first_fieldname(self.qs), self.respect_boundaries
+        )
         return self.SpanNear2Matcher(
-            ms, slop=self.slop, ordered=self.ordered, mindist=self.mindist
+            ms,
+            slop=self.slop,
+            ordered=self.ordered,
+            mindist=self.mindist,
+            respect_boundaries=enforce,
         )
 
     class SpanNear2Matcher(SpanWrappingMatcher):
-        def __init__(self, ms, slop=1, ordered=True, mindist=1):
+        def __init__(
+            self, ms, slop=1, ordered=True, mindist=1, respect_boundaries=False
+        ):
             self.ms = ms
             self.slop = slop
             self.ordered = ordered
             self.mindist = mindist
+            self.respect_boundaries = respect_boundaries
             isect = make_binary_tree(binary.IntersectionMatcher, ms)
             super().__init__(isect)
 
@@ -642,6 +774,7 @@ class SpanNear2(SpanQuery):
                 slop=self.slop,
                 ordered=self.ordered,
                 mindist=self.mindist,
+                respect_boundaries=self.respect_boundaries,
             )
 
         def replace(self, minquality=0):
@@ -693,10 +826,24 @@ class SpanNear2(SpanQuery):
                 aspans = sorted(spans)
                 i += 1
 
-            if i == len(ms):
-                return aspans
-            else:
-                return []
+            spans = aspans if i == len(ms) else []
+            if self.respect_boundaries and spans:
+                spans = self._filter_boundaries(spans)
+            return spans
+
+        def _filter_boundaries(self, spans):
+            boundaries = None
+            for m in self.ms:
+                boundaries = matcher_value_boundaries(m)
+                if boundaries:
+                    break
+            if boundaries:
+                spans = [
+                    span
+                    for span in spans
+                    if not crosses_value_boundary(span.start, span.end, boundaries)
+                ]
+            return spans
 
 
 class SpanOr(SpanQuery):
@@ -890,15 +1037,29 @@ class SpanBefore(SpanBiQuery):
         self.q = And([a, b])
 
     class _Matcher(SpanBiMatcher):
-        def __init__(self, a, b):
+        def __init__(self, a, b, respect_boundaries=False):
             self.a = a
             self.b = b
+            self.respect_boundaries = respect_boundaries
             im = binary.IntersectionMatcher(a, b)
             super().__init__(im)
 
         def _get_spans(self):
             bminstart = min(bspan.start for bspan in self.b.spans())
-            return [aspan for aspan in self.a.spans() if aspan.end < bminstart]
+            aspans = [aspan for aspan in self.a.spans() if aspan.end < bminstart]
+            if self.respect_boundaries and aspans:
+                boundaries = matcher_value_boundaries(
+                    self.a
+                ) or matcher_value_boundaries(self.b)
+                if boundaries:
+                    aspans = [
+                        aspan
+                        for aspan in aspans
+                        if not crosses_value_boundary(
+                            aspan.start, bminstart, boundaries
+                        )
+                    ]
+            return aspans
 
 
 class SpanCondition(SpanBiQuery):

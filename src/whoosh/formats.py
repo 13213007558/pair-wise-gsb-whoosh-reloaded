@@ -59,6 +59,13 @@ class Format:
     textual = True
     __inittypes__ = {"field_boost": float}
 
+    # Whether this format can index a sequence of separate text values as a
+    # multi-value field (see the MULTITEXT field type)
+    supports_multivalue = False
+    # Whether span/phrase matching on this format must never cross the
+    # boundaries between the values of a multi-value field
+    enforce_value_boundaries = False
+
     def __init__(self, field_boost=1.0, **options):
         """
         :param field_boost: A constant boost factor to scale to the score
@@ -406,6 +413,258 @@ class PositionBoosts(Positions):
             for pos, boost in self.decode_position_boosts(v):
                 s[pos] += boost
         return self.encode(sorted(s.items()))
+
+
+def multi_events(value, analyzer, position_gap, kwargs):
+    """Analyzes each item of a multi-value field value separately and
+    returns a ``(boundaries, events)`` pair, where ``events`` is a list of
+    ``(text, pos, boost, startchar, endchar)`` tuples and ``boundaries`` is a
+    sorted list of the positions at which a new value starts.
+
+    Each value is analyzed independently, so token positions and character
+    offsets keep their per-value meaning. The positions in the event list are
+    offset so that each value starts ``position_gap`` positions after the end
+    of the previous value, preventing phrase/span queries from matching
+    across values (unless the slop is greater than the gap). Empty values and
+    values that produce no tokens (for example, values containing only stop
+    words) still advance the position base by ``position_gap``, so adjacent
+    values are never "glued" together.
+    """
+
+    if isinstance(value, (list, tuple)):
+        values = value
+    else:
+        values = (value,)
+
+    kwargs["positions"] = True
+    kwargs["chars"] = True
+    kwargs["boosts"] = True
+
+    boundaries = []
+    events = []
+    base = 0
+    for i, item in enumerate(values):
+        if i:
+            # Record the position at which this value starts
+            boundaries.append(base)
+
+        if isinstance(item, (list, tuple)):
+            # The item is a sequence of pre-tokenized strings
+            gen = entoken(item, **kwargs)
+        else:
+            gen = analyzer(item, **kwargs)
+
+        local_max = -1
+        for t in unstopped(gen):
+            pos = t.pos if t.pos is not None else 0
+            events.append((t.text, base + pos, t.boost, t.startchar, t.endchar))
+            if pos > local_max:
+                local_max = pos
+
+        # The next value starts position_gap positions after the last
+        # position used by this value. Values that produced no tokens still
+        # advance the base by the gap.
+        base += local_max + 1 + position_gap
+
+    return boundaries, events
+
+
+class MultiFrequency(Frequency):
+    """Like :class:`Frequency`, but for multi-value fields: the field value
+    may be a list/tuple of separate texts, each of which is analyzed
+    independently.
+
+    Supports: frequency, weight.
+    """
+
+    supports_multivalue = True
+    __inittypes__ = {"field_boost": float, "position_gap": int}
+
+    def __init__(self, field_boost=1.0, position_gap=100, **options):
+        """
+        :param field_boost: A constant boost factor to scale to the score of
+            all queries matching terms in this field.
+        :param position_gap: the number of positions to skip between
+            consecutive values of the field.
+        """
+
+        self.field_boost = field_boost
+        self.position_gap = position_gap
+        self.options = options
+
+    def word_values(self, value, analyzer, **kwargs):
+        fb = self.field_boost
+        _, events = multi_events(value, analyzer, self.position_gap, kwargs)
+        freqs = defaultdict(int)
+        weights = defaultdict(float)
+        for text, _, boost, _, _ in events:
+            freqs[text] += 1
+            weights[text] += boost
+
+        return (
+            (w, freq, weights[w] * fb, pack_uint(freq)) for w, freq in freqs.items()
+        )
+
+
+class MultiPositions(Positions):
+    """Like :class:`Positions`, but for multi-value fields: the field value
+    may be a list/tuple of separate texts. Each text is analyzed
+    independently, and the positions of each value are offset by
+    ``position_gap`` from the previous value. The posting value additionally
+    stores the positions at which each value starts (the "value boundaries"),
+    allowing phrase/span queries to absolutely forbid matching across values
+    when the format is created with ``strict=True``.
+
+    Supports: frequency, weight, positions, position_boosts,
+    value_boundaries.
+    """
+
+    supports_multivalue = True
+    __inittypes__ = {"field_boost": float, "position_gap": int, "strict": bool}
+
+    def __init__(self, field_boost=1.0, position_gap=100, strict=False, **options):
+        """
+        :param field_boost: A constant boost factor to scale to the score of
+            all queries matching terms in this field.
+        :param position_gap: the number of positions to skip between
+            consecutive values of the field.
+        :param strict: if True, phrase/span queries on this field will never
+            match across value boundaries, regardless of slop. If False,
+            cross-value matches are only prevented by the position gap.
+        """
+
+        self.field_boost = field_boost
+        self.position_gap = position_gap
+        self.strict = strict
+        self.options = options
+
+    @property
+    def enforce_value_boundaries(self):
+        return self.strict
+
+    def word_values(self, value, analyzer, **kwargs):
+        fb = self.field_boost
+        boundaries, events = multi_events(value, analyzer, self.position_gap, kwargs)
+        poses = defaultdict(list)
+        weights = defaultdict(float)
+        for text, pos, boost, _, _ in events:
+            poses[text].append(pos)
+            weights[text] += boost
+
+        for w, poslist in poses.items():
+            yield (w, len(poslist), weights[w] * fb, self.encode(poslist, boundaries))
+
+    def encode(self, poslist, boundaries=()):
+        deltas = []
+        base = 0
+        for pos in poslist:
+            deltas.append(pos - base)
+            base = pos
+        return pack_uint(len(deltas)) + dumps((deltas, list(boundaries)), 2)
+
+    def _decode(self, valuestring):
+        if not valuestring.endswith(b"."):
+            valuestring += b"."
+        deltas, boundaries = loads(valuestring[_INT_SIZE:])
+        position = 0
+        positions = []
+        for code in deltas:
+            position += code
+            positions.append(position)
+        return positions, boundaries
+
+    def decode_positions(self, valuestring):
+        return self._decode(valuestring)[0]
+
+    def decode_value_boundaries(self, valuestring):
+        return self._decode(valuestring)[1]
+
+    def decode_frequency(self, valuestring):
+        return unpack_uint(valuestring[:_INT_SIZE])[0]
+
+    def decode_weight(self, valuestring):
+        return self.decode_frequency(valuestring) * self.field_boost
+
+    def decode_position_boosts(self, valuestring):
+        return [(pos, 1) for pos in self.decode_positions(valuestring)]
+
+    def combine(self, vs):
+        s = set()
+        boundaries = []
+        for v in vs:
+            positions, vb = self._decode(v)
+            s.update(positions)
+            boundaries = vb or boundaries
+        return self.encode(sorted(s), boundaries)
+
+
+class MultiCharacters(MultiPositions):
+    """Like :class:`Characters`, but for multi-value fields (see
+    :class:`MultiPositions`). Character offsets are per-value: each value's
+    characters start at 0.
+
+    Supports: frequency, weight, positions, position_boosts, characters,
+    value_boundaries.
+    """
+
+    def word_values(self, value, analyzer, **kwargs):
+        fb = self.field_boost
+        boundaries, events = multi_events(value, analyzer, self.position_gap, kwargs)
+        seen = defaultdict(list)
+        weights = defaultdict(float)
+        for text, pos, boost, startchar, endchar in events:
+            seen[text].append((pos, startchar, endchar))
+            weights[text] += boost
+
+        for w, poslist in seen.items():
+            yield (w, len(poslist), weights[w] * fb, self.encode(poslist, boundaries))
+
+    def encode(self, poslist, boundaries=()):
+        deltas = []
+        posbase = 0
+        charbase = 0
+        for pos, startchar, endchar in poslist:
+            deltas.append((pos - posbase, startchar - charbase, endchar - startchar))
+            posbase = pos
+            charbase = endchar
+        return pack_uint(len(deltas)) + dumps((deltas, list(boundaries)), 2)
+
+    def _decode_chars(self, valuestring):
+        if not valuestring.endswith(b"."):
+            valuestring += b"."
+        deltas, boundaries = loads(valuestring[_INT_SIZE:])
+        position = 0
+        endchar = 0
+        posns_chars = []
+        for code in deltas:
+            position = code[0] + position
+            startchar = code[1] + endchar
+            endchar = code[2] + startchar
+            posns_chars.append((position, startchar, endchar))
+        return posns_chars, boundaries
+
+    def decode_characters(self, valuestring):
+        return self._decode_chars(valuestring)[0]
+
+    def decode_value_boundaries(self, valuestring):
+        return self._decode_chars(valuestring)[1]
+
+    def decode_positions(self, valuestring):
+        return [pos for pos, _, _ in self.decode_characters(valuestring)]
+
+    def combine(self, vs):
+        s = {}
+        boundaries = []
+        for v in vs:
+            for pos, sc, ec in self.decode_characters(v):
+                if pos in s:
+                    old_sc, old_ec = s[pos]
+                    s[pos] = (min(sc, old_sc), max(ec, old_ec))
+                else:
+                    s[pos] = (sc, ec)
+            boundaries = self.decode_value_boundaries(v) or boundaries
+        poses = [(pos, s[pos][0], s[pos][1]) for pos in sorted(s.keys())]
+        return self.encode(poses, boundaries)
 
 
 class CharacterBoosts(Characters):

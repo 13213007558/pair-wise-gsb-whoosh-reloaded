@@ -1488,7 +1488,10 @@ class Hit:
             hl = highlight.Highlighter(fragmenter=sf)
             results.highlighter = hl
 
-        :param fieldname: the name of the field you want to highlight.
+        :param fieldname: the name of the field you want to highlight. If the
+            field is a multi-value field (see
+            :class:`whoosh.fields.MULTITEXT`), this method returns a list of
+            highlight strings, one for each of the field's values.
         :param text: by default, the method will attempt to load the contents
             of the field from the stored fields for the document. If the field
             you want to highlight isn't stored in the index, but you have

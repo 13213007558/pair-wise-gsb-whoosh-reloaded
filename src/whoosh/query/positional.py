@@ -31,6 +31,7 @@ import copy
 from whoosh import matching
 from whoosh.analysis import Token
 from whoosh.query import compound, qcore, terms
+from whoosh.query.spans import SpanNear2
 
 
 class Sequence(compound.CompoundQuery):
@@ -103,19 +104,23 @@ class Sequence(compound.CompoundQuery):
         return self._and_query().estimate_min_size(ixreader)
 
     def _matcher(self, subs, searcher, context):
-        from whoosh.query.spans import SpanNear
+        from whoosh.query import spans
 
         # Tell the sub-queries this matcher will need the current match to get
         # spans
         context = context.set(needs_current=True)
+        enforce = spans.resolve_value_boundaries(
+            searcher, spans.first_fieldname(subs), None
+        )
         m = self._tree_matcher(
             subs,
-            SpanNear.SpanNearMatcher,
+            spans.SpanNear.SpanNearMatcher,
             searcher,
             context,
             None,
             slop=self.slop,
             ordered=self.ordered,
+            respect_boundaries=enforce,
         )
         return m
 
@@ -126,9 +131,19 @@ class Ordered(Sequence):
     JOINT = " BEFORE "
 
     def _matcher(self, subs, searcher, context):
-        from whoosh.query.spans import SpanBefore
+        from whoosh.query import spans
 
-        return self._tree_matcher(subs, SpanBefore._Matcher, searcher, context, None)
+        enforce = spans.resolve_value_boundaries(
+            searcher, spans.first_fieldname(subs), None
+        )
+        return self._tree_matcher(
+            subs,
+            spans.SpanBefore._Matcher,
+            searcher,
+            context,
+            None,
+            respect_boundaries=enforce,
+        )
 
 
 class Phrase(qcore.Query):
@@ -241,7 +256,7 @@ class Phrase(qcore.Query):
         return self._and_query().estimate_min_size(ixreader)
 
     def matcher(self, searcher, context=None):
-        from whoosh.query import SpanNear2, Term
+        from whoosh.query import Term
 
         fieldname = self.fieldname
         if fieldname not in searcher.schema:
@@ -268,10 +283,30 @@ class Phrase(qcore.Query):
             terms.append(Term(fieldname, word))
 
         # Create the equivalent SpanNear2 query from the terms
-        q = SpanNear2(terms, slop=self.slop, ordered=True, mindist=1)
+        q = self._span_query(terms)
         # Get the matcher
         m = q.matcher(searcher, context)
 
         if self.boost != 1.0:
             m = matching.WrappingMatcher(m, boost=self.boost)
         return m
+
+    def _span_query(self, termqs):
+        return SpanNear2(termqs, slop=self.slop, ordered=True, mindist=1)
+
+
+class ValuePhrase(Phrase):
+    """A phrase query that never matches across the boundaries between the
+    values of a multi-value field (see :class:`whoosh.fields.MULTITEXT`),
+    regardless of slop.
+
+    The field must have been indexed with a format that stores value
+    boundary information (for example a MULTITEXT field); otherwise this
+    query raises a :class:`whoosh.query.QueryError` indicating that the
+    index must be rebuilt.
+    """
+
+    def _span_query(self, termqs):
+        return SpanNear2(
+            termqs, slop=self.slop, ordered=True, mindist=1, respect_boundaries=True
+        )

@@ -18,5 +18,8 @@ Formats
 .. autoclass:: Frequency
 .. autoclass:: Positions
 .. autoclass:: Characters
+.. autoclass:: MultiFrequency
+.. autoclass:: MultiPositions
+.. autoclass:: MultiCharacters
 .. autoclass:: PositionBoosts
 .. autoclass:: CharacterBoosts

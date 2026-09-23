@@ -87,6 +87,9 @@ class WrappingMatcher(mcore.Matcher):
     def spans(self):
         return self.child.spans()
 
+    def value_boundaries(self):
+        return self.child.value_boundaries()
+
     def skip_to(self, id):
         return self.child.skip_to(id)
 

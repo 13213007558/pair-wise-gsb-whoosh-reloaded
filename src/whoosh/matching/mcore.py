@@ -281,6 +281,15 @@ class Matcher:
         else:
             raise Exception("Field does not support spans")
 
+    def value_boundaries(self):
+        """Returns a sorted list of the positions at which a new value starts
+        in the current document, for multi-value fields (see
+        :class:`whoosh.fields.MULTITEXT`). Returns None if the field does
+        not store value boundary information.
+        """
+
+        return None
+
     def skip_to(self, id):
         """Moves this matcher to the first posting with an ID equal to or
         greater than the given ID.
@@ -539,6 +548,11 @@ class ListMatcher(Matcher):
     def supports(self, astype):
         return self._format.supports(astype)
 
+    def value_boundaries(self):
+        if self._format is not None and self._format.supports("value_boundaries"):
+            return self._format.decode_value_boundaries(self.value())
+        return None
+
     def next(self):
         self._i += 1
 
@@ -611,6 +625,11 @@ class LeafMatcher(Matcher):
             return [Span(pos) for pos in self.value_as("positions")]
         else:
             raise Exception(f"Field does not support positions ({self.term()!r})")
+
+    def value_boundaries(self):
+        if self.format is not None and self.format.supports("value_boundaries"):
+            return self.format.decode_value_boundaries(self.value())
+        return None
 
     def supports_block_quality(self):
         return self.scorer and self.scorer.supports_block_quality()

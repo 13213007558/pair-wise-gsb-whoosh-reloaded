@@ -104,6 +104,9 @@ class FieldType:
     multitoken_query = "default"
     sortable_typecode = None
     column_type = None
+    # Whether this field type accepts a list/tuple of separate text values
+    # as a multi-value field (see MULTITEXT)
+    multivalue = False
 
     def __init__(
         self,
@@ -1191,6 +1194,110 @@ class TEXT(FieldType):
             return self.spelling_prefix + fieldname
         else:
             return fieldname
+
+
+class MULTITEXT(TEXT):
+    """A text field that indexes a list of separate text values as if they
+    were concatenated with a configurable position gap between them, so that
+    phrase and span queries do not match across value boundaries::
+
+        schema = Schema(body=fields.MULTITEXT(stored=True, position_gap=100,
+                                              strict_boundaries=True))
+        writer.add_document(body=[u"bright red", u"car repair"])
+
+    Each value is analyzed independently, so token positions and character
+    offsets keep their per-value meaning, and empty or all-stop-word values
+    still keep neighboring values separated. The stored value is the original
+    list of values, and highlighting returns one fragment list per value.
+
+    This field type always stores value boundary information in the index.
+    Old indexes containing single-value TEXT fields are unaffected.
+    """
+
+    multivalue = True
+
+    def __init__(
+        self,
+        analyzer=None,
+        phrase=True,
+        chars=False,
+        stored=False,
+        field_boost=1.0,
+        multitoken_query="default",
+        spelling=False,
+        sortable=False,
+        lang=None,
+        vector=None,
+        spelling_prefix="spell_",
+        position_gap=100,
+        strict_boundaries=False,
+    ):
+        """
+        :param position_gap: the number of positions to skip between
+            consecutive values. Phrase/span queries with a slop smaller than
+            the gap will not match across values.
+        :param strict_boundaries: if True, phrase/span queries on this field
+            will never match across value boundaries, regardless of slop.
+            This is enforced using value boundary information stored in the
+            index, not just by making the position gap large.
+
+        The remaining keyword arguments are the same as :class:`TEXT`.
+        """
+
+        super().__init__(
+            analyzer=analyzer,
+            phrase=phrase,
+            chars=chars,
+            stored=stored,
+            field_boost=field_boost,
+            multitoken_query=multitoken_query,
+            spelling=spelling,
+            sortable=sortable,
+            lang=lang,
+            vector=vector,
+            spelling_prefix=spelling_prefix,
+        )
+
+        self.position_gap = position_gap
+        self.strict_boundaries = strict_boundaries
+
+        # Replace the single-value format set up by TEXT with the
+        # corresponding multi-value format
+        oldformat = self.format
+        if isinstance(oldformat, formats.Characters):
+            self.format = formats.MultiCharacters(
+                field_boost=field_boost,
+                position_gap=position_gap,
+                strict=strict_boundaries,
+            )
+        elif isinstance(oldformat, formats.Positions):
+            self.format = formats.MultiPositions(
+                field_boost=field_boost,
+                position_gap=position_gap,
+                strict=strict_boundaries,
+            )
+        else:
+            self.format = formats.MultiFrequency(
+                field_boost=field_boost, position_gap=position_gap
+            )
+
+        if self.vector is oldformat:
+            # vector=True was passed, so the vector format was the old index
+            # format; update it to the multi-value format as well
+            self.vector = self.format
+
+    def spellable_words(self, value):
+        if isinstance(value, (list, tuple)):
+            words = set()
+            for item in value:
+                if isinstance(item, (list, tuple)):
+                    words.update(item)
+                else:
+                    words.update(
+                        token.text for token in self.analyzer(item, no_morph=True)
+                    )
+            return iter(sorted(words))
+        return super().spellable_words(value)
 
 
 class SpellField(FieldType):

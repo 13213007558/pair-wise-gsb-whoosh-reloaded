@@ -42,7 +42,7 @@ from whoosh.query.compound import (
     SplitOr,
 )
 from whoosh.query.nested import NestedChildren, NestedParent
-from whoosh.query.positional import Ordered, Phrase, Sequence
+from whoosh.query.positional import Ordered, Phrase, Sequence, ValuePhrase
 from whoosh.query.qcolumns import ColumnMatcher, ColumnQuery
 from whoosh.query.qcore import (
     Every,

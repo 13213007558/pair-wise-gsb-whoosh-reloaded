@@ -990,6 +990,11 @@ class Highlighter:
 
         # Maybe, if the field was configured to store characters
         field = results.searcher.schema[fieldname]
+        if getattr(field, "multivalue", False):
+            # Multi-value fields are highlighted one value at a time, so the
+            # stored character offsets (which are per-value) can't be used
+            # directly; re-tokenize each value instead
+            return False
         return field.supports("characters")
 
     @staticmethod
@@ -1056,6 +1061,22 @@ class Highlighter:
             if fieldname not in hitobj:
                 raise KeyError(f"Field {fieldname!r} is not stored.")
             text = hitobj[fieldname]
+
+        if isinstance(text, (list, tuple)) and getattr(field, "multivalue", False):
+            # Multi-value field (see fields.MULTITEXT): highlight each value
+            # independently and return a list of highlight outputs, one per
+            # value, instead of joining the values into a single string
+            return [
+                self.highlight_hit(
+                    hitobj,
+                    fieldname,
+                    text=value,
+                    top=top,
+                    minscore=minscore,
+                    strict_phrase=strict_phrase,
+                )
+                for value in text
+            ]
 
         # Get the terms searched for/matched in this field
         if results.has_matched_terms():
