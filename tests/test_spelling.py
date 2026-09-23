@@ -345,6 +345,195 @@ def test_very_long_words():
             w.optimize = True
 
 
+_place_words = sorted(
+    "new york hotel hotels grand central plaza station inn suites "
+    "manhattan brooklyn".split()
+)
+_place_freqs = {
+    "hotel": 20,
+    "new": 15,
+    "york": 15,
+    "grand": 10,
+    "central": 10,
+    "plaza": 8,
+    "manhattan": 7,
+    "inn": 6,
+    "station": 5,
+    "brooklyn": 5,
+    "hotels": 4,
+    "suites": 3,
+}
+_place_bigrams = {
+    ("new", "york"): 1000,
+    ("grand", "central"): 800,
+    ("central", "station"): 200,
+    ("york", "hotel"): 100,
+    ("york", "plaza"): 30,
+}
+
+
+def _place_corrector(**kwargs):
+    args = dict(
+        wordlist=_place_words, word_freq=_place_freqs,
+        bigram_freq=_place_bigrams,
+    )
+    args.update(kwargs)
+    return spelling.ContextualQueryCorrector(**args)
+
+
+def test_contextual_split_and_spell():
+    c = _place_corrector()
+    cor = c.correct("newyork hotle")
+    assert cor.text == "new york hotel"
+    assert cor.exhaustive
+
+    # Every change carries offsets into the original string
+    assert len(cor.changes) == 2
+    first, second = cor.changes
+    assert (first.start, first.end) == (0, 7)
+    assert first.original == "newyork"
+    assert first.replacement == "new york"
+    assert "split" in first.reason
+    assert (second.start, second.end) == (8, 13)
+    assert second.original == "hotle"
+    assert second.replacement == "hotel"
+    assert "spelling" in second.reason
+    for change in cor.changes:
+        assert "newyork hotle"[change.start:change.end] == change.original
+
+    # Alternatives are ranked and include the un-split fallback
+    assert cor.alternatives[0].text == "new york hotel"
+    alt_texts = [a.text for a in cor.alternatives]
+    assert "newyork hotel" in alt_texts
+
+
+def test_contextual_merge():
+    c = _place_corrector()
+    cor = c.correct("hot el")
+    assert cor.text == "hotel"
+    assert len(cor.changes) == 1
+    change = cor.changes[0]
+    assert change.original == "hot el"
+    assert change.replacement == "hotel"
+    assert "merged" in change.reason
+
+
+def test_contextual_quoted_phrase_preserved():
+    c = _place_corrector()
+    cor = c.correct('"newyork hotle" hotle')
+    assert cor.text == '"newyork hotle" hotel'
+    assert len(cor.changes) == 1
+    assert cor.changes[0].original == "hotle"
+
+
+def test_contextual_field_and_wildcard_preserved():
+    c = _place_corrector()
+    cor = c.correct("sku:A* hotle")
+    assert cor.text == "sku:A* hotel"
+
+    cor = c.correct("sku:12345 hotle")
+    assert cor.text == "sku:12345 hotel"
+
+    cor = c.correct("hotle AND (newyork OR plaza)")
+    assert cor.text == "hotel AND (new york OR plaza)"
+
+
+def test_contextual_reader_dictionary():
+    schema = fields.Schema(text=fields.TEXT())
+    with TempIndex(schema, "ctxspell") as ix:
+        with ix.writer() as w:
+            w.add_document(text="new york hotel")
+            w.add_document(text="new york plaza")
+            w.add_document(text="grand central station")
+            w.add_document(text="hotel inn suites")
+            w.add_document(text="hotel brooklyn manhattan")
+
+        with ix.reader() as r:
+            c = spelling.ContextualQueryCorrector(
+                reader=r, fieldname="text", bigram_freq=_place_bigrams
+            )
+            cor = c.correct("newyork hotle")
+            assert cor.text == "new york hotel"
+            assert cor.exhaustive
+
+            cor = c.correct("hot el")
+            assert cor.text == "hotel"
+
+
+def test_contextual_limits_mark_not_exhaustive():
+    c = _place_corrector()
+    assert c.correct("newyork hotle").exhaustive
+
+    c = _place_corrector(max_states=1)
+    assert not c.correct("newyork hotle").exhaustive
+
+    c = _place_corrector(max_candidates=1)
+    assert not c.correct("newyork hotle").exhaustive
+
+
+def test_contextual_configurable_costs():
+    # A very expensive split effectively disables splitting
+    costs = spelling.CorrectionCosts(split=100.0)
+    c = _place_corrector(costs=costs)
+    assert c.correct("newyork").text == "newyork"
+
+    # A very expensive merge effectively disables merging
+    costs = spelling.CorrectionCosts(merge=100.0)
+    c = _place_corrector(costs=costs, context_weight=0.0)
+    assert c.correct("hot el").text == "hot el"
+
+    # Per-character costs are configurable too
+    costs = spelling.CorrectionCosts(replace=0.5)
+    c = _place_corrector(costs=costs)
+    best_cost, best_word = c.word_candidates("hotle")[0]
+    assert best_word == "hotel"
+    assert best_cost == 1.0
+
+
+def test_contextual_tie_break_is_deterministic():
+    words = ["hotem", "hotel"]
+    c = spelling.ContextualQueryCorrector(
+        wordlist=words, oov_cost=3.0,
+    )
+    cor = c.correct("hotle")
+    # Both candidates have the same cost and context; ties break by text
+    assert cor.alternatives[0].text == "hotel"
+    assert cor.alternatives[1].text == "hotem"
+    assert cor.alternatives[0].score == cor.alternatives[1].score
+
+
+def test_contextual_no_split_merge_matches_word_corrector():
+    # With split and merge disabled, the new interface preserves the
+    # existing per-word suggestion behavior
+    c = _place_corrector(allow_split=False, allow_merge=False)
+
+    cor = c.correct("newyork hotle")
+    assert cor.text == "newyork hotel"
+
+    # Per-word candidates match the classic ListCorrector suggestions
+    classic = spelling.ListCorrector(_place_words)
+    assert [w for _, w in c.word_candidates("hotle")] == classic.suggest(
+        "hotle", maxdist=2
+    )
+
+    schema = fields.Schema(text=fields.TEXT())
+    with TempIndex(schema, "ctxcompat") as ix:
+        with ix.writer() as w:
+            w.add_document(text="new york hotel")
+            w.add_document(text="grand central station")
+            w.add_document(text="hotel inn suites")
+
+        with ix.reader() as r:
+            rc = spelling.ReaderCorrector(r, "text", schema["text"])
+            c = spelling.ContextualQueryCorrector(
+                reader=r, fieldname="text",
+                allow_split=False, allow_merge=False,
+            )
+            assert [w for _, w in c.word_candidates("hotle")] == rc.suggest(
+                "hotle", maxdist=2
+            )
+
+
 # def test_add_spelling():
 #     schema = fields.Schema(text1=fields.TEXT, text2=fields.TEXT)
 #     ix = RamStorage().create_index(schema)

@@ -29,6 +29,8 @@
 This module contains helper functions for correcting typos in user queries.
 """
 
+import math
+
 from bisect import bisect_left
 from heapq import heappush, heapreplace
 
@@ -341,3 +343,575 @@ class SimpleQueryCorrector(QueryCorrector):
                     corrected_tokens.append(token)
 
         return Correction(q, qstring, corrected_q, corrected_tokens)
+
+
+# Contextual (split/merge) query correction
+
+
+class CorrectionCosts:
+    """
+    Configurable costs for the edit operations used by
+    ContextualQueryCorrector.
+
+    "insert", "delete" and "replace" are the per-character costs used when
+    computing the weighted edit distance between a query word and a
+    dictionary word. "split" is the extra cost of splitting one query word
+    into two dictionary words, and "merge" is the extra cost of merging two
+    adjacent query words into one dictionary word (both are added to any
+    per-character edit costs of the parts).
+    """
+
+    def __init__(self, insert=1.0, delete=1.0, replace=1.0, split=1.0,
+                 merge=1.0):
+        self.insert = insert
+        self.delete = delete
+        self.replace = replace
+        self.split = split
+        self.merge = merge
+
+    def __repr__(self):
+        return (
+            "%s(insert=%r, delete=%r, replace=%r, split=%r, merge=%r)"
+            % (self.__class__.__name__, self.insert, self.delete,
+               self.replace, self.split, self.merge)
+        )
+
+
+def _edit_cost(a, b, costs):
+    # Weighted edit distance between strings a and b using the per-character
+    # insert/delete/replace costs from a CorrectionCosts object.
+    la, lb = len(a), len(b)
+    if not la:
+        return lb * costs.insert
+    if not lb:
+        return la * costs.delete
+    prev = [j * costs.insert for j in range(lb + 1)]
+    for i in range(1, la + 1):
+        ca = a[i - 1]
+        cur = [i * costs.delete] + [0.0] * lb
+        for j in range(1, lb + 1):
+            sub = prev[j - 1] if ca == b[j - 1] else prev[j - 1] + costs.replace
+            cur[j] = min(sub, prev[j] + costs.delete, cur[j - 1] + costs.insert)
+        prev = cur
+    return prev[lb]
+
+
+class QueryChange:
+    """
+    Represents a single replacement in a corrected query string.
+
+    "start" and "end" are character offsets into the *original* query
+    string, "original" is the text that was replaced, "replacement" is the
+    new text, and "reason" is a human-readable explanation of why the
+    change was made.
+    """
+
+    def __init__(self, start, end, original, replacement, reason):
+        self.start = start
+        self.end = end
+        self.original = original
+        self.replacement = replacement
+        self.reason = reason
+
+    def __repr__(self):
+        return "%s(%r:%r, %r -> %r)" % (
+            self.__class__.__name__, self.start, self.end,
+            self.original, self.replacement,
+        )
+
+    def __eq__(self, other):
+        return (
+            isinstance(other, QueryChange)
+            and (self.start, self.end, self.original, self.replacement,
+                 self.reason)
+            == (other.start, other.end, other.original, other.replacement,
+                other.reason)
+        )
+
+    def __ne__(self, other):
+        return not self.__eq__(other)
+
+
+class RewrittenQuery:
+    """
+    One possible rewrite of a query string, as produced by
+    :meth:ContextualQueryCorrector.correct.
+
+    "text" is the rewritten query string, "cost" is the total edit cost,
+    "context_score" is the accumulated context (unigram/bigram) score,
+    "score" is the final ranking value (lower is better), and "changes" is
+    a list of :class:QueryChange objects with offsets into the original
+    query string.
+    """
+
+    def __init__(self, text, cost, context_score, score, changes):
+        self.text = text
+        self.cost = cost
+        self.context_score = context_score
+        self.score = score
+        self.changes = changes
+
+    def __repr__(self):
+        return "%s(%r, score=%.3f)" % (
+            self.__class__.__name__, self.text, self.score,
+        )
+
+
+class QueryCorrection:
+    """
+    The result of correcting a raw query string with
+    :class:ContextualQueryCorrector.
+
+    "original" is the original query string. "text" and "changes" are the
+    best rewrite and its list of :class:QueryChange objects. "alternatives"
+    is the ranked list of the top-K :class:RewrittenQuery objects (the
+    first one is the best). "exhaustive" is False when the candidate or
+    search-state limits were hit, meaning cheaper rewrites may exist that
+    were not explored.
+    """
+
+    def __init__(self, original, alternatives, exhaustive):
+        self.original = original
+        self.alternatives = alternatives
+        self.exhaustive = exhaustive
+        if alternatives:
+            best = alternatives[0]
+            self.text = best.text
+            self.changes = best.changes
+        else:
+            self.text = original
+            self.changes = []
+
+    def __repr__(self):
+        return "%s(%r -> %r, exhaustive=%r)" % (
+            self.__class__.__name__, self.original, self.text,
+            self.exhaustive,
+        )
+
+
+# Query string scanning
+
+# Tokens containing any of these characters are considered query syntax and
+# are never corrected.
+_SYNTAX_CHARS = frozenset(":*?^~")
+# Characters that delimit tokens and are always treated as syntax.
+_BRACKET_CHARS = frozenset("()[]{}\"")
+# Boolean operator tokens are never corrected.
+_BOOL_TOKENS = frozenset(("AND", "OR", "NOT", "ANDNOT", "&&", "||", "!"))
+
+
+def _scan_fragments(qstring):
+    # Splits a query string into runs of correctable plain words. Returns a
+    # list of fragments, where each fragment is a list of (start, end, word)
+    # tuples with character offsets into qstring. Quoted spans, field
+    # prefixes, boolean operators, wildcards, boosts, groups and +/- clauses
+    # are treated as syntax and left out of the fragments.
+    fragments = []
+    current = []
+    in_quote = False
+    prev_field_prefix = False
+    i, n = 0, len(qstring)
+
+    def close_fragment():
+        if current:
+            fragments.append(current[:])
+            del current[:]
+
+    while i < n:
+        ch = qstring[i]
+        if ch.isspace():
+            i += 1
+            continue
+        if ch in _BRACKET_CHARS:
+            if ch == "\"":
+                in_quote = not in_quote
+            close_fragment()
+            prev_field_prefix = False
+            i += 1
+            continue
+        start = i
+        while i < n and not qstring[i].isspace() \
+                and qstring[i] not in _BRACKET_CHARS:
+            i += 1
+        token = qstring[start:i]
+        protected = (
+            in_quote
+            or prev_field_prefix
+            or token in _BOOL_TOKENS
+            or token[0] in "+-"
+            or any(c in token for c in _SYNTAX_CHARS)
+            or token.endswith(":")
+        )
+        if protected:
+            close_fragment()
+        else:
+            current.append((start, i, token))
+        prev_field_prefix = token.endswith(":")
+    close_fragment()
+    return fragments
+
+
+def _apply_changes(qstring, changes):
+    # Splices the given changes (with offsets into qstring) into the query
+    # string and returns the rewritten string.
+    out = []
+    pos = 0
+    for ch in sorted(changes, key=lambda c: (c.start, c.end)):
+        out.append(qstring[pos:ch.start])
+        out.append(ch.replacement)
+        pos = ch.end
+    out.append(qstring[pos:])
+    return "".join(out)
+
+
+class _FragState:
+    # One search state while correcting a fragment of plain words.
+    __slots__ = ("cost", "context", "out", "changes")
+
+    def __init__(self, cost, context, out, changes):
+        self.cost = cost
+        self.context = context
+        self.out = out
+        self.changes = changes
+
+
+class ContextualQueryCorrector:
+    """
+    Corrects raw user query strings using a dictionary (read from an index
+    reader or a supplied word list) and application-supplied adjacent-word
+    (bigram) frequencies.
+
+    Unlike :class:SimpleQueryCorrector, this corrector works on whole runs
+    of plain words at once: besides per-word insert/delete/replace edits it
+    can split one word into two dictionary words (newyork -> new york) and
+    merge two adjacent words into one (hot el -> hotel), and it ranks the
+    rewrites by total edit cost combined with a context score derived from
+    word and bigram frequencies. No online model is used; the index is only
+    ever read from.
+
+    Query syntax is preserved: quoted phrases, field: prefixes, boolean
+    operators, wildcards, boosts and groups are copied to the output
+    verbatim and only runs of plain words are eligible for correction.
+    """
+
+    def __init__(self, reader=None, fieldname=None, wordlist=None,
+                 word_freq=None, bigram_freq=None, costs=None,
+                 context_weight=0.5, oov_cost=1.0, allow_split=True,
+                 allow_merge=True, max_op_cost=2.0, max_candidates=32,
+                 max_states=64, top_k=5):
+        """
+        :param reader: an index reader used as the source of the dictionary
+            and unigram frequencies. The reader is only read from.
+        :param fieldname: the field to read the dictionary from (required
+            when reader is given).
+        :param wordlist: an explicit list of dictionary words, used instead
+            of a reader.
+        :param word_freq: optional mapping of word -> frequency, used with
+            wordlist (defaults to 1 for every word).
+        :param bigram_freq: optional mapping of (word1, word2) -> frequency
+            supplied by the application, used for the context score.
+        :param costs: a CorrectionCosts object with the per-operation costs.
+        :param context_weight: how strongly the context score influences
+            ranking; the final score is cost - context_weight * context.
+        :param oov_cost: the cost of keeping a word that is not in the
+            dictionary (words in the dictionary are kept for free).
+        :param allow_split: allow splitting one word into two.
+        :param allow_merge: allow merging two adjacent words into one.
+        :param max_op_cost: the maximum total cost of a single
+            replace/split/merge operation.
+        :param max_candidates: the maximum number of replacement candidates
+            considered per word (and per split/merge operation).
+        :param max_states: the maximum number of search states kept per
+            word position (beam width).
+        :param top_k: the maximum number of alternatives returned.
+        """
+
+        if reader is None and wordlist is None:
+            raise ValueError("Either reader or wordlist is required")
+        if reader is not None:
+            if fieldname is None:
+                raise ValueError("fieldname is required with a reader")
+            fieldobj = reader.schema[fieldname]
+            sugfield = fieldobj.spelling_fieldname(fieldname)
+            words = []
+            freqs = {}
+            for bterm in reader.lexicon(sugfield):
+                word = fieldobj.from_bytes(bterm)
+                words.append(word)
+                freqs[word] = reader.frequency(fieldname, word) or 1
+        else:
+            words = sorted(wordlist)
+            word_freq = word_freq or {}
+            freqs = dict((w, word_freq.get(w, 1)) for w in words)
+
+        self.words = words
+        self.word_set = frozenset(words)
+        self.freqs = freqs
+        self.bigram_freq = dict(bigram_freq or {})
+        self.costs = costs or CorrectionCosts()
+        self.context_weight = context_weight
+        self.oov_cost = oov_cost
+        self.allow_split = allow_split
+        self.allow_merge = allow_merge
+        self.max_op_cost = max_op_cost
+        self.max_candidates = max_candidates
+        self.max_states = max_states
+        self.top_k = top_k
+        # Set to True whenever a limit truncates the search.
+        self._limit_hit = False
+
+    # Candidate generation
+
+    def _word_candidates(self, word):
+        # Returns (candidates, truncated) where candidates is a sorted list
+        # of (edit_cost, word) tuples within max_op_cost of the given word,
+        # excluding the word itself.
+        results = []
+        maxcost = self.max_op_cost
+        for w in self.words:
+            if w == word:
+                continue
+            c = _edit_cost(word, w, self.costs)
+            if c <= maxcost:
+                results.append((c, w))
+        results.sort(key=lambda t: (t[0], -self.freqs.get(t[1], 0), t[1]))
+        truncated = False
+        if len(results) > self.max_candidates:
+            results = results[: self.max_candidates]
+            truncated = True
+        return results, truncated
+
+    def word_candidates(self, word):
+        """
+        Returns the per-word replacement candidates for the given word as a
+        list of (edit_cost, word) tuples, mirroring the behavior of the
+        classic per-word correctors when split/merge are disabled.
+        """
+
+        return self._word_candidates(word)[0]
+
+    def _cands_incl_exact(self, word):
+        cands, truncated = self._word_candidates(word)
+        if word in self.word_set:
+            cands = [(0.0, word)] + cands
+        return cands, truncated
+
+    def _split_candidates(self, word):
+        # Returns (candidates, truncated) where candidates is a sorted list
+        # of (cost, (word1, word2)) tuples for splitting the word into two
+        # dictionary words.
+        best = {}
+        truncated = False
+        for i in range(1, len(word)):
+            lefts, trunc = self._cands_incl_exact(word[:i])
+            truncated = truncated or trunc
+            rights, trunc = self._cands_incl_exact(word[i:])
+            truncated = truncated or trunc
+            for cl, wl in lefts:
+                if self.costs.split + cl > self.max_op_cost:
+                    continue
+                for cr, wr in rights:
+                    total = self.costs.split + cl + cr
+                    if total > self.max_op_cost:
+                        continue
+                    pair = (wl, wr)
+                    if pair not in best or total < best[pair]:
+                        best[pair] = total
+        results = sorted(
+            ((c, pair) for pair, c in best.items()),
+            key=lambda t: (t[0], t[1]),
+        )
+        if len(results) > self.max_candidates:
+            results = results[: self.max_candidates]
+            truncated = True
+        return results, truncated
+
+    def _merge_candidates(self, word1, word2):
+        # Returns (candidates, truncated) where candidates is a sorted list
+        # of (cost, word) tuples for merging two adjacent query words into
+        # one dictionary word.
+        cands, truncated = self._cands_incl_exact(word1 + word2)
+        results = []
+        for c, w in cands:
+            total = self.costs.merge + c
+            if total <= self.max_op_cost:
+                results.append((total, w))
+        results.sort(key=lambda t: (t[0], t[1]))
+        if len(results) > self.max_candidates:
+            results = results[: self.max_candidates]
+            truncated = True
+        return results, truncated
+
+    # Fragment correction
+
+    def _context_bonus(self, prev_word, word):
+        bonus = math.log1p(self.freqs.get(word, 0))
+        if prev_word is not None:
+            bonus += math.log1p(self.bigram_freq.get((prev_word, word), 0))
+        return bonus
+
+    def _rank_key(self, state):
+        return (
+            state.cost - self.context_weight * state.context,
+            state.out,
+        )
+
+    def _advance(self, buckets, pos, state, op_cost, new_words, change):
+        context = state.context
+        prev = state.out[-1] if state.out else None
+        for w in new_words:
+            context += self._context_bonus(prev, w)
+            prev = w
+        changes = state.changes
+        if change is not None:
+            changes = changes + (change,)
+        buckets.setdefault(pos, []).append(
+            _FragState(state.cost + op_cost, context,
+                       state.out + tuple(new_words), changes)
+        )
+
+    def _prune(self, bucket):
+        if len(bucket) > self.max_states:
+            bucket.sort(key=self._rank_key)
+            del bucket[self.max_states:]
+            self._limit_hit = True
+
+    def correct_fragment(self, words, spans=None):
+        """
+        Corrects a run of plain words. Returns a tuple (alternatives,
+        exhaustive) where alternatives is a ranked list of RewrittenQuery
+        objects whose changes have offsets relative to the given spans (or
+        relative to a synthetic layout if spans is not given).
+        """
+
+        if spans is None:
+            spans = []
+            pos = 0
+            for w in words:
+                spans.append((pos, pos + len(w)))
+                pos += len(w) + 1
+
+        self._limit_hit = False
+        buckets = {0: [_FragState(0.0, 0.0, (), ())]}
+        n = len(words)
+        for pos in range(n):
+            bucket = buckets.get(pos)
+            if not bucket:
+                continue
+            word = words[pos]
+            start, end = spans[pos]
+            for state in bucket:
+                # Keep the word as-is (free if it is in the dictionary).
+                keep_cost = 0.0 if word in self.word_set else self.oov_cost
+                self._advance(buckets, pos + 1, state, keep_cost, (word,),
+                              None)
+                # Replace the word with a dictionary word.
+                cands, trunc = self._word_candidates(word)
+                self._limit_hit = self._limit_hit or trunc
+                for c, w in cands:
+                    change = (start, end, word, w, "spell", c)
+                    self._advance(buckets, pos + 1, state, c, (w,), change)
+                # Split the word into two dictionary words.
+                if self.allow_split:
+                    cands, trunc = self._split_candidates(word)
+                    self._limit_hit = self._limit_hit or trunc
+                    for c, (w1, w2) in cands:
+                        change = (start, end, word, w1 + " " + w2, "split", c)
+                        self._advance(buckets, pos + 1, state, c, (w1, w2),
+                                      change)
+                # Merge this word and the next into one dictionary word.
+                if self.allow_merge and pos + 1 < n:
+                    cands, trunc = self._merge_candidates(word, words[pos + 1])
+                    self._limit_hit = self._limit_hit or trunc
+                    end2 = spans[pos + 1][1]
+                    for c, w in cands:
+                        original = word + " " + words[pos + 1]
+                        change = (start, end2, original, w, "merge", c)
+                        self._advance(buckets, pos + 2, state, c, (w,),
+                                      change)
+            self._prune(buckets.get(pos + 1, []))
+            if pos + 2 <= n:
+                self._prune(buckets.get(pos + 2, []))
+
+        finals = buckets.get(n, [])
+        finals.sort(key=self._rank_key)
+        # Selecting the top-K final states is the intended output limit,
+        # not a search limit, so it does not affect exhaustiveness.
+        finals = finals[: self.top_k]
+
+        alternatives = []
+        for state in finals:
+            changes = tuple(
+                QueryChange(s, e, orig, repl, self._reason(kind, orig, repl, c))
+                for s, e, orig, repl, kind, c in state.changes
+            )
+            score = state.cost - self.context_weight * state.context
+            alternatives.append(
+                RewrittenQuery(" ".join(state.out), state.cost,
+                               state.context, score, changes)
+            )
+        return alternatives, not self._limit_hit
+
+    @staticmethod
+    def _reason(kind, original, replacement, cost):
+        if kind == "spell":
+            return "corrected spelling of '%s' to '%s' (cost %g)" % (
+                original, replacement, cost)
+        elif kind == "split":
+            return "split '%s' into '%s' (cost %g)" % (
+                original, replacement, cost)
+        else:
+            return "merged '%s' into '%s' (cost %g)" % (
+                original, replacement, cost)
+
+    # Whole-query correction
+
+    def correct(self, qstring, limit=None):
+        """
+        Corrects a raw user query string and returns a QueryCorrection
+        object. Only runs of plain words are corrected; query syntax (field:
+        prefixes, quoted phrases, boolean operators, wildcards, boosts and
+        groups) is preserved verbatim.
+
+        :param qstring: the raw user query string.
+        :param limit: the maximum number of alternatives to return
+            (defaults to top_k).
+        """
+
+        limit = limit or self.top_k
+        fragments = _scan_fragments(qstring)
+        per_fragment = []
+        exhaustive = True
+        for frag in fragments:
+            words = [w for _, _, w in frag]
+            spans = [(s, e) for s, e, _ in frag]
+            alts, frag_exhaustive = self.correct_fragment(words, spans)
+            exhaustive = exhaustive and frag_exhaustive
+            per_fragment.append(alts)
+
+        alternatives = []
+        if per_fragment:
+            # Combine the per-fragment alternatives: the k-th overall
+            # alternative uses the k-th best alternative of each fragment
+            # (falling back to the best one when a fragment has fewer).
+            count = min(max(len(alts) for alts in per_fragment), limit)
+            for k in range(count):
+                changes = []
+                cost = 0.0
+                context = 0.0
+                for alts in per_fragment:
+                    alt = alts[min(k, len(alts) - 1)]
+                    changes.extend(alt.changes)
+                    cost += alt.cost
+                    context += alt.context_score
+                changes = tuple(
+                    sorted(changes, key=lambda c: (c.start, c.end)))
+                text = _apply_changes(qstring, changes)
+                score = cost - self.context_weight * context
+                alternatives.append(
+                    RewrittenQuery(text, cost, context, score, changes))
+            alternatives.sort(key=lambda a: (a.score, a.text))
+        else:
+            alternatives.append(RewrittenQuery(qstring, 0.0, 0.0, 0.0, ()))
+
+        return QueryCorrection(qstring, alternatives, exhaustive)
