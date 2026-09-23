@@ -223,13 +223,36 @@ class QueryParser:
                     e = sys.exc_info()[1]
                     return query.error_query(e)
 
+            # If the field's analyzer expands multi-word synonyms into a
+            # token graph, build the query from the graph's token paths
+            from whoosh.analysis.synonyms import has_synonym_filter
+
+            analyzer = getattr(field, "analyzer", None)
+            if tokenize and analyzer is not None and has_synonym_filter(analyzer):
+                tokens = [
+                    t.copy()
+                    for t in field.tokenize(
+                        text,
+                        mode="query",
+                        tokenize=tokenize,
+                        removestops=removestops,
+                        positions=True,
+                    )
+                ]
+                if any(hasattr(t, "poslength") for t in tokens):
+                    return self._graph_term_query(fieldname, tokens, termclass, boost)
+                texts = [t.text for t in tokens]
             # Otherwise, ask the field to process the text into a list of
             # tokenized strings
-            texts = list(
-                field.process_text(
-                    text, mode="query", tokenize=tokenize, removestops=removestops
+            else:
+                texts = list(
+                    field.process_text(
+                        text,
+                        mode="query",
+                        tokenize=tokenize,
+                        removestops=removestops,
+                    )
                 )
-            )
 
             # If the analyzer returned more than one token, use the field's
             # multitoken_query attribute to decide what query class, if any, to
@@ -246,6 +269,35 @@ class QueryParser:
             text = texts[0]
 
         return termclass(fieldname, text, boost=boost)
+
+    def _graph_term_query(self, fieldname, tokens, termclass, boost):
+        # Builds a query from the complete legal token paths of a synonym
+        # token graph: single-word paths become term queries, longer paths
+        # become phrase queries, and the paths are combined with Or
+        from whoosh.analysis.synonyms import graph_paths
+
+        subqs = []
+        seen = set()
+        for path in graph_paths(tokens):
+            words = tuple(t.text for t in path)
+            if not words or words in seen:
+                continue
+            seen.add(words)
+            holes = sum(getattr(t, "hole_before", 0) for t in path[1:])
+            if len(words) == 1:
+                subqs.append(termclass(fieldname, words[0], boost=boost))
+            else:
+                subqs.append(
+                    self.phraseclass(
+                        fieldname, list(words), slop=1 + holes, boost=boost
+                    )
+                )
+
+        if not subqs:
+            return None
+        if len(subqs) == 1:
+            return subqs[0]
+        return query.Or(subqs)
 
     def taggers(self):
         """Returns a priorized list of tagger objects provided by the parser's

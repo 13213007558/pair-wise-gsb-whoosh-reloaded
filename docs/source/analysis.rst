@@ -292,6 +292,49 @@ only the tokens whose ``stopped`` attribute is ``False``.
     attribute is ``True``.
 
 
+Multi-word synonyms
+-------------------
+
+The :class:`whoosh.analysis.SynonymGraphFilter` filter applies
+application-provided, multi-word synonym rules to the query token stream.
+Rules live in a :class:`whoosh.analysis.SynonymMap` object and support
+word-to-multi-word (``nyc`` -> ``new york city``),
+multi-word-to-word (``new york city`` -> ``nyc``), and optionally keeping
+the original words as an alternative (``keep_orig=True``)::
+
+    >>> from whoosh import analysis
+    >>> synmap = analysis.SynonymMap()
+    >>> synmap.add("nyc", "new york city", keep_orig=True)
+    >>> analyzer = (analysis.RegexTokenizer() | analysis.LowercaseFilter()
+    ...             | analysis.SynonymGraphFilter(synmap))
+
+Matching is deterministic: at each token position the rule with the longest
+left-hand side wins, ties between rules with the same left-hand side are
+broken by the order the rules were added, and the words produced by a rule
+are never re-scanned for further matches (so rules cannot expand
+recursively).
+
+Instead of squashing all alternatives into one position, the filter emits a
+token *graph* (each token carries a ``poslength`` span). The query parser
+turns the graph into one query per complete legal token path, combined with
+:class:`whoosh.query.Or`. A phrase search for ``"visit nyc office"`` can
+therefore match ``visit new york city office``, but can never match a mixed
+path such as ``new city office``. Character ranges of expansion tokens map
+back to the original query text, so highlighting still marks the original
+words, and position holes left by removed stop words are preserved as
+additional phrase slop.
+
+Because the filter only expands tokens in ``query`` mode by default, the
+index keeps the original words and existing indexes do not need to be
+rebuilt.
+
+The number of token paths a single query may expand into is capped
+(``max_paths``, defaulting to
+:data:`whoosh.analysis.DEFAULT_MAX_PATHS`). If a query would expand beyond
+the limit, :class:`whoosh.analysis.SynonymExpansionError` is raised instead
+of silently dropping candidate paths.
+
+
 Implementation notes
 --------------------
 

@@ -707,8 +707,22 @@ class PhrasePlugin(Plugin):
             if parser.schema and fieldname in parser.schema:
                 field = parser.schema[fieldname]
                 if field.analyzer:
+                    from whoosh.analysis.synonyms import has_synonym_filter
+
                     # We have a field with an analyzer, so use it to parse
                     # the phrase into tokens
+                    if has_synonym_filter(field.analyzer):
+                        # The analyzer expands multi-word synonyms into a
+                        # token graph: ask for positions and build one phrase
+                        # per complete legal token path
+                        tokens = [
+                            t.copy()
+                            for t in field.tokenize(
+                                text, mode="query", chars=True, positions=True
+                            )
+                        ]
+                        q = self._graph_query(parser, fieldname, tokens, sc)
+                        return attach(q, self)
                     tokens = field.tokenize(text, mode="query", chars=True)
                     words = []
                     char_ranges = []
@@ -739,6 +753,39 @@ class PhrasePlugin(Plugin):
                 char_ranges=char_ranges,
             )
             return attach(q, self)
+
+        def _graph_query(self, parser, fieldname, tokens, sc):
+            # Builds an Or query with one phrase query per complete legal
+            # token path through a synonym token graph
+            from whoosh.analysis.synonyms import graph_paths
+
+            qclass = parser.phraseclass
+            subqs = []
+            seen = set()
+            for path in graph_paths(tokens):
+                words = tuple(t.text for t in path)
+                if words in seen:
+                    continue
+                seen.add(words)
+                char_ranges = [(sc + t.startchar, sc + t.endchar) for t in path]
+                # Compensate the slop for position holes (e.g. removed stop
+                # words) recorded along this path
+                holes = sum(getattr(t, "hole_before", 0) for t in path[1:])
+                subqs.append(
+                    qclass(
+                        fieldname,
+                        list(words),
+                        slop=self.slop + holes,
+                        boost=self.boost,
+                        char_ranges=char_ranges,
+                    )
+                )
+
+            if not subqs:
+                return query.NullQuery
+            if len(subqs) == 1:
+                return subqs[0]
+            return query.Or(subqs)
 
     class PhraseTagger(RegexTagger):
         def create(self, parser, match):
