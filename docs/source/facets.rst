@@ -763,6 +763,54 @@ is equal sort by the value of another field::
     results = searcher.search(myquery, sortedby=[tf, "name"])
 
 
+Disjunctive (multi-select) faceting
+=====================================
+
+In many faceted interfaces, when the user selects a value in one facet (for
+example ``brand=a``), you still want to show the counts for the *other* values
+of that facet, computed as if that facet's filter were not applied, while
+still applying the filters from the other facets. This is called disjunctive
+faceting.
+
+Use :meth:`whoosh.searching.Searcher.search_disjunctive` (or the equivalent
+:func:`whoosh.disjunctive.search_disjunctive` function) with a
+:class:`whoosh.disjunctive.FacetFilters` object to mark which facet each
+filter belongs to. Multiple filters in the same facet are ORed together,
+filters from different facets are ANDed, and mandatory filters added with
+:meth:`~whoosh.disjunctive.FacetFilters.add_mandatory` always apply, to the
+hits and to every facet's counts::
+
+    from whoosh import query
+    from whoosh.disjunctive import FacetFilters
+
+    filters = FacetFilters()
+    filters.add("brand", query.Term("brand", "a"))
+    filters.add("color", query.Term("color", "red"))
+    filters.add("color", query.Term("color", "blue"))  # red OR blue
+    filters.add_mandatory(query.Term("instock", True))
+
+    with ix.searcher() as s:
+        dr = s.search_disjunctive(myquery, ["brand", "color"],
+                                  filters=filters, limit=20)
+
+        # The hits have ALL filters applied
+        for hit in dr.results:
+            print(hit["title"])
+
+        # The counts for each facet are computed without that facet's own
+        # filters, so the user can still see the other options
+        for bucket, count in dr.buckets("brand"):
+            print(bucket, count)
+
+The returned :class:`whoosh.disjunctive.DisjunctiveResults` object holds the
+hits (``results``) and the per-facet counts (``counts(name)`` and
+``buckets(name)``). Documents with multiple values in a field count once
+towards each value's bucket; documents with no value fall into a "missing"
+bucket (``None`` by default, configurable with the ``missing`` argument).
+Facet counts are always computed over all matching documents, so changing
+``limit``, ``pagenum``, or ``pagelen`` never affects them. All queries run on
+the same searcher, so the hits and counts come from a fixed index snapshot.
+
 Expert: writing your own facet
 ==============================
 

@@ -668,6 +668,45 @@ class Searcher:
         results = self.search(query, limit=pagenum * pagelen, **kwargs)
         return ResultsPage(results, pagenum, pagelen)
 
+    def search_disjunctive(self, q, facets, filters=None, **kwargs):
+        """Runs a search with disjunctive (multi-select) faceting and returns
+        a :class:`whoosh.disjunctive.DisjunctiveResults` object
+        containing both the hits (with all filters applied) and per-facet
+        bucket counts (each computed without that facet's own filters).
+
+        This is a convenience wrapper around
+        :func:`whoosh.disjunctive.search_disjunctive`; see its documentation
+        for a description of the arguments. All queries run on this searcher,
+        so the hits and counts come from the same fixed index snapshot::
+
+            from whoosh import query
+            from whoosh.disjunctive import FacetFilters
+
+            filters = FacetFilters()
+            filters.add("brand", query.Term("brand", "a"))
+            filters.add("color", query.Term("color", "red"))
+
+            with ix.searcher() as s:
+                dr = s.search_disjunctive(myquery, ["brand", "color"],
+                                          filters=filters)
+                for hit in dr.results:
+                    print(hit["title"])
+                print(dr.buckets("brand"))
+
+        :param q: the main :class:`whoosh.query.Query` object.
+        :param facets: the facets to count (field names, a dictionary of
+            :class:`whoosh.sorting.FacetType` objects, or a
+            :class:`whoosh.sorting.Facets` object).
+        :param filters: a :class:`whoosh.disjunctive.FacetFilters` object
+            (or a dictionary or single query, see
+            :func:`whoosh.disjunctive.search_disjunctive`).
+        :rtype: :class:`whoosh.disjunctive.DisjunctiveResults`
+        """
+
+        from whoosh.disjunctive import search_disjunctive
+
+        return search_disjunctive(self, q, facets, filters=filters, **kwargs)
+
     def find(self, defaultfield, querystring, **kwargs):
         from whoosh.qparser import QueryParser
 
