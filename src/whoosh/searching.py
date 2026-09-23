@@ -1497,6 +1497,11 @@ class Hit:
         :param top: the maximum number of fragments to return.
         :param minscore: the minimum score for fragments to appear in the
             highlights.
+
+        For multi-valued fields (see :class:`whoosh.fields.MULTITEXT`), this
+        method returns a list of ``(value_index, highlighted_text)`` tuples,
+        one for each value that produced fragments, instead of a single
+        string.
         """
 
         hliter = self.results.highlighter

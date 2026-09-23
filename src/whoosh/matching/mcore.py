@@ -602,7 +602,25 @@ class LeafMatcher(Matcher):
     def spans(self):
         from whoosh.query.spans import Span
 
-        if self.supports("characters"):
+        fmt = self.format
+        strict_values = getattr(fmt, "strict", False)
+        if strict_values and self.supports("value_characters"):
+            return [
+                Span(
+                    pos,
+                    startchar=startchar,
+                    endchar=endchar,
+                    startvalue=validx,
+                    endvalue=validx,
+                )
+                for pos, validx, startchar, endchar in self.value_as("value_characters")
+            ]
+        elif strict_values and self.supports("value_positions"):
+            return [
+                Span(pos, startvalue=validx, endvalue=validx)
+                for pos, validx in self.value_as("value_positions")
+            ]
+        elif self.supports("characters"):
             return [
                 Span(pos, startchar=startchar, endchar=endchar)
                 for pos, startchar, endchar in self.value_as("characters")

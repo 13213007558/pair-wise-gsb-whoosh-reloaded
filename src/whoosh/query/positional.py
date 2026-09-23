@@ -248,6 +248,19 @@ class Phrase(qcore.Query):
             return matching.NullMatcher()
 
         field = searcher.schema[fieldname]
+        if (
+            getattr(field, "multivalue", False)
+            and not getattr(field, "cross_values", True)
+            and (not field.format or not field.format.supports("value_positions"))
+        ):
+            # The field is configured to forbid matches across value
+            # boundaries; this requires value information in the postings
+            raise qcore.QueryError(
+                f"Phrase search: {self.fieldname!r} field was not indexed"
+                " with multi-value position information. Rebuild the"
+                " index using fields.MULTITEXT(phrase=True) to enable"
+                " value-boundary-aware phrase queries"
+            )
         if not field.format or not field.format.supports("positions"):
             raise qcore.QueryError(
                 f"Phrase search: {self.fieldname!r} field has no positions"

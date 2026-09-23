@@ -57,6 +57,9 @@ class Format:
 
     posting_size = -1
     textual = True
+    # Whether this format records per-position value identifiers for
+    # multi-valued fields (see the Multi* formats below)
+    multivalue = False
     __inittypes__ = {"field_boost": float}
 
     def __init__(self, field_boost=1.0, **options):
@@ -133,6 +136,36 @@ def tokens(value, analyzer, kwargs):
     else:
         gen = analyzer(value, **kwargs)
     return unstopped(gen)
+
+
+def multitokens(value, analyzer, gap, kwargs):
+    """Takes a sequence of text values (a multi-valued field value) and yields
+    the tokens from running the analyzer on each value in turn, with the token
+    positions of each successive value offset so there is at least ``gap``
+    positions between the last token of one value and the first token of the
+    next.
+
+    Each yielded token gets a ``validx`` attribute containing the index of the
+    value it came from. Token positions and character offsets produced by the
+    analyzer keep their per-value meaning; only the token position is shifted
+    into the global (document-level) position space.
+
+    Values that produce no tokens (empty strings, stop-word-only text, etc.)
+    still advance the position base by ``gap``, so the tokens of neighbouring
+    values can never 'glue together' across an empty value.
+    """
+
+    base = 0
+    for validx, subvalue in enumerate(value):
+        lastpos = -1
+        for t in unstopped(analyzer(subvalue, **kwargs)):
+            pos = getattr(t, "pos", None)
+            if pos is not None:
+                lastpos = pos
+                t.pos = base + pos
+            t.validx = validx
+            yield t
+        base += lastpos + 1 + gap
 
 
 class Existence(Format):
@@ -489,3 +522,240 @@ class CharacterBoosts(Characters):
                     s[pos] = (sc, ec, boost)
         poses = [(pos, sc, ec, boost) for pos, (sc, ec, boost) in sorted(s.items())]
         return self.encode(poses)[0]  # encode() returns value, summedboost
+
+
+# Multi-valued field formats
+
+
+class MultiFormat:
+    """Mixin for formats that index multi-valued fields (for example
+    :class:`whoosh.fields.MULTITEXT`).
+
+    These formats run the analyzer on each value of a list of texts and
+    record, for each token position, the index of the value the token came
+    from. Consecutive values are separated in the position space by a
+    configurable ``position_gap``.
+
+    If ``strict`` is True, positional queries (phrase, span) will never
+    match across a value boundary, no matter how large the query slop is.
+    If ``strict`` is False, values are only separated by ``position_gap``
+    positions, so a query with a slop greater than the gap may still match
+    across values.
+    """
+
+    multivalue = True
+    __inittypes__ = {
+        "field_boost": float,
+        "position_gap": int,
+        "strict": bool,
+    }
+
+    def __init__(self, field_boost=1.0, position_gap=100, strict=False, **options):
+        """
+        :param field_boost: A constant boost factor to scale to the score of
+            all queries matching terms in this field.
+        :param position_gap: the number of positions to leave between
+            consecutive values of a multi-valued field.
+        :param strict: if True, phrase/span queries are absolutely forbidden
+            from matching across a value boundary, instead of relying on a
+            large position gap.
+        """
+
+        self.field_boost = field_boost
+        self.position_gap = position_gap
+        self.strict = strict
+        self.options = options
+
+    def _multitokens(self, value, analyzer, kwargs):
+        if isinstance(value, (list, tuple)):
+            return multitokens(value, analyzer, self.position_gap, kwargs)
+        # Degenerate case: a single value is a one-element multi-value
+        return multitokens([value], analyzer, self.position_gap, kwargs)
+
+
+class MultiFrequency(MultiFormat, Frequency):
+    """Like :class:`Frequency`, but analyzes each value of a multi-valued
+    field separately. Does not store positions, so value boundaries have no
+    query-time effect; this format exists so that list values are analyzed
+    per value instead of being treated as pre-tokenized terms.
+
+    Supports: frequency, weight.
+    """
+
+    posting_size = _INT_SIZE
+
+    def word_values(self, value, analyzer, **kwargs):
+        fb = self.field_boost
+        freqs = defaultdict(int)
+        weights = defaultdict(float)
+
+        kwargs["boosts"] = True
+        for t in self._multitokens(value, analyzer, kwargs):
+            freqs[t.text] += 1
+            weights[t.text] += t.boost
+
+        wvs = ((w, freq, weights[w] * fb, pack_uint(freq)) for w, freq in freqs.items())
+        return wvs
+
+
+class MultiPositions(MultiFormat, Positions):
+    """Like :class:`Positions`, but for multi-valued fields: stores, for
+    each token position, the index of the value the token occurred at.
+
+    Supports: frequency, weight, positions, position_boosts, value_positions.
+    """
+
+    def word_values(self, value, analyzer, **kwargs):
+        fb = self.field_boost
+        poses = defaultdict(list)
+        weights = defaultdict(float)
+
+        kwargs["positions"] = True
+        kwargs["boosts"] = True
+        for t in self._multitokens(value, analyzer, kwargs):
+            poses[t.text].append((t.pos, t.validx))
+            weights[t.text] += t.boost
+
+        for w, poslist in poses.items():
+            value = self.encode(poslist)
+            yield (w, len(poslist), weights[w] * fb, value)
+
+    def encode(self, poslist):
+        # poslist is a list of (position, value_index) pairs, sorted by
+        # position. Positions and value indexes are both non-decreasing, so
+        # they can be delta-encoded
+        deltas = []
+        posbase = 0
+        valbase = 0
+        for pos, validx in poslist:
+            deltas.append((pos - posbase, validx - valbase))
+            posbase = pos
+            valbase = validx
+        return pack_uint(len(deltas)) + dumps(deltas, 2)
+
+    def decode_value_positions(self, valuestring):
+        if not valuestring.endswith(b"."):
+            valuestring += b"."
+        codes = loads(valuestring[_INT_SIZE:])
+        position = 0
+        validx = 0
+        posns_vals = []
+        for code in codes:
+            position += code[0]
+            validx += code[1]
+            posns_vals.append((position, validx))
+        return posns_vals
+
+    def decode_positions(self, valuestring):
+        return [pos for pos, _ in self.decode_value_positions(valuestring)]
+
+    def decode_frequency(self, valuestring):
+        return unpack_uint(valuestring[:_INT_SIZE])[0]
+
+    def decode_weight(self, valuestring):
+        return self.decode_frequency(valuestring) * self.field_boost
+
+    def decode_position_boosts(self, valuestring):
+        return [(pos, 1) for pos in self.decode_positions(valuestring)]
+
+    def combine(self, vs):
+        s = {pos: validx for v in vs for pos, validx in self.decode_value_positions(v)}
+        return self.encode(sorted(s.items()))
+
+
+class MultiCharacters(MultiPositions):
+    """Like :class:`Characters`, but for multi-valued fields: stores token
+    positions, per-value character offsets, and per-position value indexes.
+
+    Character offsets are stored relative to the start of the value the
+    token occurred in, so they keep their per-value meaning.
+
+    Supports: frequency, weight, positions, position_boosts, characters,
+    value_positions, value_characters.
+    """
+
+    def word_values(self, value, analyzer, **kwargs):
+        fb = self.field_boost
+        seen = defaultdict(list)
+        weights = defaultdict(float)
+
+        kwargs["positions"] = True
+        kwargs["chars"] = True
+        kwargs["boosts"] = True
+        for t in self._multitokens(value, analyzer, kwargs):
+            seen[t.text].append((t.pos, t.validx, t.startchar, t.endchar))
+            weights[t.text] += t.boost
+
+        for w, poslist in seen.items():
+            value = self.encode(poslist)
+            yield (w, len(poslist), weights[w] * fb, value)
+
+    def encode(self, poslist):
+        # poslist is a list of (position, value_index, startchar, endchar)
+        # tuples. Character offsets are per-value: when the value index
+        # changes, the character delta is encoded relative to zero
+        deltas = []
+        posbase = 0
+        valbase = 0
+        charbase = 0
+        lastvalidx = 0
+        for pos, validx, startchar, endchar in poslist:
+            if validx != lastvalidx:
+                charbase = 0
+            deltas.append(
+                (
+                    pos - posbase,
+                    validx - valbase,
+                    startchar - charbase,
+                    endchar - startchar,
+                )
+            )
+            posbase = pos
+            valbase = validx
+            charbase = endchar
+            lastvalidx = validx
+        return pack_uint(len(deltas)) + dumps(deltas, 2)
+
+    def decode_value_characters(self, valuestring):
+        if not valuestring.endswith(b"."):
+            valuestring += b"."
+        codes = loads(valuestring[_INT_SIZE:])
+        position = 0
+        validx = 0
+        endchar = 0
+        lastvalidx = 0
+        posns_chars = []
+        for code in codes:
+            position += code[0]
+            validx += code[1]
+            if validx != lastvalidx:
+                endchar = 0
+            startchar = endchar + code[2]
+            endchar = startchar + code[3]
+            posns_chars.append((position, validx, startchar, endchar))
+            lastvalidx = validx
+        return posns_chars
+
+    def decode_value_positions(self, valuestring):
+        return [
+            (pos, validx)
+            for pos, validx, _, _ in self.decode_value_characters(valuestring)
+        ]
+
+    def decode_characters(self, valuestring):
+        return [
+            (pos, startchar, endchar)
+            for pos, _, startchar, endchar in self.decode_value_characters(valuestring)
+        ]
+
+    def combine(self, vs):
+        s = {}
+        for v in vs:
+            for pos, validx, sc, ec in self.decode_value_characters(v):
+                if pos in s:
+                    old_validx, old_sc, old_ec = s[pos]
+                    s[pos] = (old_validx, min(sc, old_sc), max(ec, old_ec))
+                else:
+                    s[pos] = (validx, sc, ec)
+        poses = [(pos, validx, sc, ec) for pos, (validx, sc, ec) in sorted(s.items())]
+        return self.encode(poses)

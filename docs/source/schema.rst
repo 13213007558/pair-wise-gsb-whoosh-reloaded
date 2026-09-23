@@ -47,6 +47,32 @@ Whoosh provides some useful predefined field types:
     circumstances it can be useful (see :doc:`highlight`). Use
     ``TEXT(stored=True)`` to specify that the text should be stored in the index.
 
+:class:` whoosh.fields.MULTITEXT`
+    This type is like ``TEXT``, but each document's field value is a *list of
+    texts* instead of a single string, and Whoosh keeps track of which value
+    each term came from::
+
+        schema = Schema(tags=fields.MULTITEXT(stored=True))
+        w = ix.writer()
+        w.add_document(tags=["bright red", "car repair"])
+
+    A phrase query for "red car" will not match the document above, because
+    the two words occur in different values. Consecutive values are separated
+    in the position space by a configurable gap (``position_gap``, default
+    100). By default (``cross_values=False``), phrase and span queries can
+    never match across a value boundary, no matter how much slop you allow.
+    If you pass ``cross_values=True``, values are only separated by the
+    position gap, so a positional query with enough slop may match across
+    values.
+
+    The analyzer runs on each value separately, so stop-word positions and
+    character offsets keep their per-value meaning, and empty or
+    stop-word-only values still separate their neighbours.
+
+    The stored value of the field is the original list. Highlighting a
+    multi-valued field returns a list of ``(value_index, highlighted_text)``
+    tuples instead of a single string.
+
 :class:` whoosh.fields.KEYWORD`
     This field type is designed for space- or comma-separated keywords. This
     type is indexed and searchable (and optionally stored). To save space, it

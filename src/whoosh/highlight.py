@@ -990,6 +990,10 @@ class Highlighter:
 
         # Maybe, if the field was configured to store characters
         field = results.searcher.schema[fieldname]
+        if getattr(field, "multivalue", False):
+            # No, multi-valued fields are re-tokenized value by value so
+            # fragments never mix text from different values
+            return False
         return field.supports("characters")
 
     @staticmethod
@@ -1065,6 +1069,37 @@ class Highlighter:
         # Convert bytes to unicode
         words = frozenset(from_bytes(term[1]) for term in bterms)
 
+        if isinstance(text, (list, tuple)):
+            # Multi-valued field: highlight each value separately and return
+            # a list of (value_index, highlighted_text) pairs for the values
+            # that produced fragments
+            outputs = []
+            for validx, subtext in enumerate(text):
+                output = self._highlight_text(
+                    subtext,
+                    words,
+                    results,
+                    hitobj,
+                    fieldname,
+                    top,
+                    minscore,
+                    strict_phrase,
+                )
+                if output:
+                    outputs.append((validx, output))
+            return outputs
+
+        return self._highlight_text(
+            text, words, results, hitobj, fieldname, top, minscore, strict_phrase
+        )
+
+    def _highlight_text(
+        self, text, words, results, hitobj, fieldname, top, minscore, strict_phrase
+    ):
+        schema = results.searcher.schema
+        field = schema[fieldname]
+        to_bytes = field.to_bytes
+
         # If we can do "pinpoint" highlighting...
         if self.can_load_chars(results, fieldname):
             # Build the docnum->[(startchar, endchar),] map
@@ -1072,7 +1107,7 @@ class Highlighter:
                 self._load_chars(results, fieldname, words, to_bytes)
 
             hitterms = (
-                from_bytes(term[1])
+                field.from_bytes(term[1])
                 for term in hitobj.matched_terms()
                 if term[0] == fieldname
             )

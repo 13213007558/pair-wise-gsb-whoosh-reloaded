@@ -53,9 +53,26 @@ from whoosh.util import make_binary_tree
 
 
 class Span:
-    __slots__ = ("start", "end", "startchar", "endchar", "boost")
+    __slots__ = (
+        "start",
+        "end",
+        "startchar",
+        "endchar",
+        "boost",
+        "startvalue",
+        "endvalue",
+    )
 
-    def __init__(self, start, end=None, startchar=None, endchar=None, boost=1.0):
+    def __init__(
+        self,
+        start,
+        end=None,
+        startchar=None,
+        endchar=None,
+        boost=1.0,
+        startvalue=None,
+        endvalue=None,
+    ):
         if end is None:
             end = start
         assert start <= end
@@ -64,6 +81,11 @@ class Span:
         self.startchar = startchar
         self.endchar = endchar
         self.boost = boost
+        # For multi-valued fields: the indexes of the field values the
+        # start and end positions of this span occur in. These are None for
+        # fields that don't record value boundaries
+        self.startvalue = startvalue
+        self.endvalue = endvalue
 
     def __repr__(self):
         if self.startchar is not None or self.endchar is not None:
@@ -116,6 +138,11 @@ class Span:
                 there = spans[j]
                 if there.start > here.end + 1:
                     break
+                if not values_compatible(here, there):
+                    # Don't merge spans from different values of a
+                    # multi-valued field
+                    j += 1
+                    continue
                 if here.touches(there) or here.overlaps(there):
                     here = here.to(there)
                     spans[i] = here
@@ -141,7 +168,34 @@ class Span:
 
         minpos = min(self.start, span.start)
         maxpos = max(self.end, span.end)
-        return self.__class__(minpos, maxpos, minchar, maxchar)
+        if self.startvalue is None or span.startvalue is None:
+            startvalue = endvalue = None
+        else:
+            if self.start <= span.start:
+                startvalue = self.startvalue
+            else:
+                startvalue = span.startvalue
+            if self.end >= span.end:
+                endvalue = self.endvalue
+            else:
+                endvalue = span.endvalue
+        return self.__class__(
+            minpos,
+            maxpos,
+            minchar,
+            maxchar,
+            startvalue=startvalue,
+            endvalue=endvalue,
+        )
+
+    def same_value(self, span):
+        """Returns True if this span and the other span are compatible with
+        respect to multi-valued field boundaries: either at least one of the
+        spans carries no value information, or both spans lie within the same
+        value.
+        """
+
+        return values_compatible(self, span)
 
     def overlaps(self, span):
         return (
@@ -173,6 +227,17 @@ class Span:
             return span.start - self.end
         else:
             return self.start - span.end
+
+
+def values_compatible(aspan, bspan):
+    """Returns True if two spans may be combined with respect to
+    multi-valued field boundaries: True unless both spans carry value
+    information and they lie in different values.
+    """
+
+    if aspan.startvalue is None or bspan.startvalue is None:
+        return True
+    return aspan.startvalue == bspan.startvalue
 
 
 def bisect_spans(spans, start):
@@ -521,7 +586,7 @@ class SpanNear(SpanQuery):
 
                     # Check the distance between the spans
                     dist = aspan.distance_to(bspan)
-                    if mindist <= dist <= slop:
+                    if mindist <= dist <= slop and values_compatible(aspan, bspan):
                         spans.add(aspan.to(bspan))
 
             return sorted(spans)
@@ -688,7 +753,7 @@ class SpanNear2(SpanQuery):
 
                         # Check the distance between the spans
                         dist = aspan.distance_to(bspan)
-                        if mindist <= dist <= slop:
+                        if mindist <= dist <= slop and values_compatible(aspan, bspan):
                             spans.add(aspan.to(bspan))
                 aspans = sorted(spans)
                 i += 1
@@ -897,8 +962,15 @@ class SpanBefore(SpanBiQuery):
             super().__init__(im)
 
         def _get_spans(self):
-            bminstart = min(bspan.start for bspan in self.b.spans())
-            return [aspan for aspan in self.a.spans() if aspan.end < bminstart]
+            bspans = self.b.spans()
+            spans = []
+            for aspan in self.a.spans():
+                starts = [
+                    bspan.start for bspan in bspans if values_compatible(aspan, bspan)
+                ]
+                if starts and aspan.end < min(starts):
+                    spans.append(aspan)
+            return spans
 
 
 class SpanCondition(SpanBiQuery):

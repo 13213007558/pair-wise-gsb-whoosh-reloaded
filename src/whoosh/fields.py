@@ -104,6 +104,9 @@ class FieldType:
     multitoken_query = "default"
     sortable_typecode = None
     column_type = None
+    # Whether this field type indexes lists of values with per-value
+    # position information (see MULTITEXT)
+    multivalue = False
 
     def __init__(
         self,
@@ -1191,6 +1194,107 @@ class TEXT(FieldType):
             return self.spelling_prefix + fieldname
         else:
             return fieldname
+
+
+class MULTITEXT(TEXT):
+    """
+    A text field that indexes a *list of text values* per document instead of
+    a single string, keeping track of which value each token came from.
+
+    For example, with a field like this::
+
+        schema = Schema(tags=fields.MULTITEXT(stored=True))
+        w = ix.writer()
+        w.add_document(tags=["bright red", "car repair"])
+
+    ...a phrase query for "red car" will NOT match the document, because the
+    two words occur in different values. If the document instead contained
+    ``["bright red car"]``, the phrase would match.
+
+    The analyzer runs on each value separately, exactly as if the value were
+    indexed on its own: stop-word positions and character offsets keep their
+    per-value meaning. Empty values and values that only produce stop words
+    still count as values, so the tokens of neighbouring values are never
+    "glued together".
+
+    The stored value of the field is the original list of values, and
+    highlighting a multi-valued field returns fragments per value (see
+    :meth:`whoosh.highlight.Highlighter.highlight_hit`).
+    """
+
+    multivalue = True
+
+    def __init__(
+        self,
+        analyzer=None,
+        phrase=True,
+        chars=False,
+        stored=False,
+        field_boost=1.0,
+        multitoken_query="default",
+        spelling=False,
+        sortable=False,
+        lang=None,
+        vector=None,
+        spelling_prefix="spell_",
+        position_gap=100,
+        cross_values=False,
+    ):
+        """
+        :param position_gap: the number of positions to leave between
+            consecutive values in the position space. This affects scoring
+            and how much slop a positional query needs to (potentially) match
+            across a value boundary.
+        :param cross_values: if False (the default), phrase and span queries
+            can never match across a value boundary, regardless of slop. If
+            True, values are only separated by ``position_gap`` positions,
+            so a positional query with a slop larger than the gap may match
+            across values.
+        """
+
+        self.position_gap = position_gap
+        self.cross_values = cross_values
+
+        TEXT.__init__(
+            self,
+            analyzer=analyzer,
+            phrase=phrase,
+            chars=chars,
+            stored=stored,
+            field_boost=field_boost,
+            multitoken_query=multitoken_query,
+            spelling=spelling,
+            sortable=sortable,
+            lang=lang,
+            vector=vector,
+            spelling_prefix=spelling_prefix,
+        )
+
+        strict = not cross_values
+        if chars:
+            formatclass = formats.MultiCharacters
+        elif phrase:
+            formatclass = formats.MultiPositions
+        else:
+            formatclass = formats.MultiFrequency
+        self.format = formatclass(
+            field_boost=field_boost, position_gap=position_gap, strict=strict
+        )
+
+        if vector is True:
+            self.vector = self.format
+        elif isinstance(vector, formats.Format):
+            self.vector = vector
+
+    def spellable_words(self, value):
+        # Analyze each value separately instead of treating the list as a
+        # stream of pre-tokenized words
+        if isinstance(value, (list, tuple)):
+            words = set()
+            for subvalue in value:
+                words.update(TEXT.spellable_words(self, subvalue))
+            return iter(sorted(words))
+        return TEXT.spellable_words(self, value)
 
 
 class SpellField(FieldType):
