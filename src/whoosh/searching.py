@@ -33,7 +33,7 @@ import copy
 import weakref
 from math import ceil
 
-from whoosh import classify, highlight, query, scoring
+from whoosh import classify, highlight, query, scoring, sorting
 from whoosh.idsets import BitSet, DocIdSet
 from whoosh.reading import TermNotFound
 
@@ -696,6 +696,110 @@ class Searcher:
             for docnum in method(self):
                 yield docnum
 
+    def _and_queries(self, queries):
+        clauses = [q for q in queries if q is not None]
+        if not clauses:
+            return None
+        elif len(clauses) == 1:
+            return clauses[0]
+        else:
+            return query.And(clauses).normalize()
+
+    def _disjunctive_facetmaps(
+        self, base_q, facets, facet_filters, filter=None, mask=None, maptype=None
+    ):
+        allow = self._filter_to_comb(filter) if filter is not None else None
+        restrict = self._filter_to_comb(mask) if mask is not None else None
+
+        facetmaps = {}
+        for facetname, facet in facets.items():
+            facetmap = facet.map(
+                maptype if maptype is not None else sorting.Count
+            )
+            categorizer = facet.categorizer(self)
+            grouped_q = facet_filters.to_query(exclude=facetname)
+            count_q = self._and_queries([base_q, grouped_q])
+
+            for subsearcher, offset in self.leaf_searchers():
+                categorizer.set_searcher(subsearcher, offset)
+                for sub_docnum in count_q.docs(subsearcher):
+                    global_docnum = offset + sub_docnum
+                    if allow is not None and global_docnum not in allow:
+                        continue
+                    if restrict is not None and global_docnum in restrict:
+                        continue
+
+                    if categorizer.allow_overlap:
+                        seen = set()
+                        keys = categorizer.keys_for(None, sub_docnum)
+                        for key in keys:
+                            groupname = categorizer.key_to_name(key)
+                            if groupname in seen:
+                                continue
+                            seen.add(groupname)
+                            facetmap.add(groupname, global_docnum, global_docnum)
+                    else:
+                        key = categorizer.key_for(None, sub_docnum)
+                        groupname = categorizer.key_to_name(key)
+                        facetmap.add(groupname, global_docnum, global_docnum)
+
+            facetmaps[facetname] = facetmap
+        return facetmaps
+
+    def _search_disjunctive(
+        self,
+        q,
+        groupedby,
+        facet_filters,
+        required_filters=None,
+        maptype=None,
+        **kwargs,
+    ):
+        if groupedby is None:
+            raise ValueError("facet_filters requires groupedby")
+
+        facets = sorting.Facets.from_groupedby(groupedby)
+        for facetname, facet in facets.items():
+            if not isinstance(facet, sorting.FieldFacet):
+                raise ValueError(
+                    "disjunctive faceting currently only supports FieldFacet "
+                    f"objects ({facetname!r} uses {facet!r})"
+                )
+
+        facet_filters = sorting.FacetFilters.from_filters(facet_filters).copy()
+        if required_filters is not None:
+            facet_filters.add_required(required_filters)
+
+        filter_arg = kwargs.pop("filter", None)
+        mask = kwargs.pop("mask", None)
+
+        mandatory_queries = []
+        if isinstance(filter_arg, query.Query):
+            mandatory_queries.append(filter_arg)
+            filter_arg = None
+
+        base_q = self._and_queries([q] + mandatory_queries)
+        full_q = self._and_queries([base_q, facet_filters.to_query()])
+
+        c = self.collector(
+            groupedby=None,
+            maptype=None,
+            filter=filter_arg,
+            mask=mask,
+            **kwargs,
+        )
+        self.search_with_collector(full_q, c)
+        results = c.results()
+        results._facetmaps = self._disjunctive_facetmaps(
+            base_q,
+            facets,
+            facet_filters,
+            filter=filter_arg,
+            mask=mask,
+            maptype=maptype,
+        )
+        return results
+
     def collector(
         self,
         limit=10,
@@ -767,7 +871,7 @@ class Searcher:
             )
 
         # Filtering wraps last so it sees the docs first
-        if filter or mask:
+        if filter is not None or mask is not None:
             c = collectors.FilterCollector(c, filter, mask)
         return c
 
@@ -800,6 +904,15 @@ class Searcher:
             will only contain documents that are also in the filter object.
         :param mask: a query, Results object, or set of docnums. The results
             will not contain any documents that are in the mask object.
+        :param facet_filters: an optional :class:`whoosh.sorting.FacetFilters`
+            object, or a dictionary mapping facet names to a query or iterable
+            of queries. When this argument is used, ``groupedby`` must contain
+            only :class:`whoosh.sorting.FieldFacet` objects. Queries in each
+            facet group are ORed together, facet groups are ANDed together,
+            and each facet's counts omit only its own filter group.
+        :param required_filters: an optional query or iterable of queries that
+            must apply to the hits and to every disjunctive facet count. The
+            ``filter`` and ``mask`` arguments are also always mandatory.
         :param terms: if True, record which terms were found in each matching
             document. See :doc:`/searching` for more information. Default is
             False.
@@ -823,6 +936,10 @@ class Searcher:
 
         # Call the collector() method to build a collector based on the
         # parameters passed to this method
+        facet_filters = kwargs.pop("facet_filters", None)
+        if facet_filters is not None:
+            return self._search_disjunctive(q, facet_filters=facet_filters, **kwargs)
+
         c = self.collector(**kwargs)
         # Call the lower-level method to run the collector
         self.search_with_collector(q, c)
@@ -1707,3 +1824,13 @@ class ResultsPage:
         """Returns True if this object represents the last page of results."""
 
         return self.pagecount == 0 or self.pagenum == self.pagecount
+
+    def facet_names(self):
+        """Returns the available facet names on the underlying results."""
+
+        return self.results.facet_names()
+
+    def groups(self, name=None):
+        """Returns facet groups from the underlying results."""
+
+        return self.results.groups(name)

@@ -363,6 +363,68 @@ To group results by the *intersected values of multiple fields*, use a
     results = searcher.search(myquery, groupedby={"tag/size": mf})
 
 
+Disjunctive faceting
+--------------------
+
+Ordinary grouping counts only the documents remaining after all filters. In a
+faceted search interface, this can make the available choices disappear. For
+example, after a user selects ``brand=a`` and ``color=red``, the brand list
+should still show how many red products are available for other brands.
+
+Use the ``facet_filters`` keyword argument to explicitly associate filter
+queries with facet names. Queries in the same facet group are ORed together,
+and different facet groups are ANDed together. When Whoosh computes the counts
+for a facet, it omits only that facet's own filter group, while retaining the
+main query, all other facet groups, and all mandatory filters::
+
+    facets = {
+        "brand": sorting.FieldFacet("brand"),
+        "color": sorting.FieldFacet("color"),
+    }
+    filters = sorting.FacetFilters()
+    filters.add_filter("brand", query.Term("brand", "a"))
+    filters.add_filter("color", query.Term("color", "red"))
+    filters.add_required(query.Term("in_stock", "yes"))
+
+    results = searcher.search(
+        myquery,
+        groupedby=facets,
+        facet_filters=filters,
+        sortedby=["price", "sku"],
+    )
+
+    # Hits match brand=a AND color=red AND in_stock=yes.
+    hits = list(results)
+
+    # Brand counts omit brand=a, but retain color=red and in_stock=yes.
+    brand_counts = results.groups("brand")
+
+    # Color counts omit color=red, but retain brand=a and in_stock=yes.
+    color_counts = results.groups("color")
+
+You can also pass a dictionary as ``facet_filters``. Each value may be a single
+query or an iterable of queries::
+
+    filters = {
+        "brand": [query.Term("brand", "a"), query.Term("brand", "b")],
+        "color": query.Term("color", "red"),
+    }
+
+The existing ``filter`` and ``mask`` arguments are mandatory and apply to both
+the hit list and every facet count. You can also pass query objects using
+``required_filters``. Disjunctive counts default to
+:class:`whoosh.sorting.Count` maps and are computed over the complete matching
+set on the current searcher snapshot, so changing ``limit`` or the requested
+page size does not change the counts. Documents with multiple values for a
+:class:`whoosh.sorting.FieldFacet` using ``allow_overlap=True`` count at most
+once in each bucket, and documents with no value form a separate ``None``
+bucket when the field's categorizer represents missing values as ``None``.
+
+Disjunctive faceting currently supports ``FieldFacet`` only. Whoosh does not
+try to infer facet groups from an arbitrary query object; the caller must
+provide the explicit ``facet_filters`` grouping.
+
+
 Getting the faceted groups
 --------------------------
 

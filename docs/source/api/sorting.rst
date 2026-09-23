@@ -34,6 +34,9 @@ Facets object
 .. autoclass:: Facets
     :members:
 
+.. autoclass:: FacetFilters
+    :members:
+
 
 FacetType objects
 =================

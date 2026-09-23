@@ -28,6 +28,8 @@
 from array import array
 from collections import defaultdict
 
+from whoosh import query
+
 # Faceting objects
 
 
@@ -942,6 +944,142 @@ class Facets:
             if replace or name not in self.facets:
                 self.facets[name] = facet
         return self
+
+
+class FacetFilters:
+    """Explicitly groups filter queries by the facet they belong to.
+
+    This object is used with the ``facet_filters`` keyword argument to
+    :meth:`whoosh.searching.Searcher.search` to compute disjunctive facet
+    counts. Queries in the same facet group are ORed together, and the facet
+    groups are ANDed together. Queries added with :meth:`add_required` are
+    always applied and are never omitted when computing facet counts.
+
+    >>> filters = FacetFilters()
+    >>> filters.add_filter("brand", query.Term("brand", "apple"))
+    >>> filters.add_filter("color", query.Term("color", "red"))
+    >>> filters.add_required(query.Term("in_stock", "yes"))
+    """
+
+    def __init__(self, filters=None, required=None):
+        """
+        :param filters: a dictionary mapping facet names to a query or an
+            iterable of queries, or an iterable of ``(facetname, query)``
+            pairs.
+        :param required: a query or iterable of queries that must apply to
+            both the hits and every facet count.
+        """
+
+        self.filters = defaultdict(list)
+        self.required = []
+
+        if filters is not None:
+            self.add_filters(filters)
+        if required is not None:
+            self.add_required(required)
+
+    @classmethod
+    def from_filters(cls, filters):
+        """Converts a supported filter grouping object to ``FacetFilters``."""
+
+        if filters is None:
+            return cls()
+        elif isinstance(filters, cls):
+            return filters
+        else:
+            return cls(filters)
+
+    def __bool__(self):
+        return bool(self.filters or self.required)
+
+    def __len__(self):
+        return len(self.filters)
+
+    def __iter__(self):
+        return iter(self.filters)
+
+    def items(self):
+        return self.filters.items()
+
+    def copy(self):
+        copied = self.__class__()
+        copied.filters = defaultdict(
+            list, {name: list(queries) for name, queries in self.filters.items()}
+        )
+        copied.required = list(self.required)
+        return copied
+
+    def _add_query(self, queries, q):
+        if not isinstance(q, query.Query):
+            raise TypeError(f"Facet filter {q!r} is not a query object")
+        queries.append(q)
+
+    def _add_value(self, queries, value):
+        if isinstance(value, query.Query):
+            self._add_query(queries, value)
+        else:
+            try:
+                iterator = iter(value)
+            except TypeError:
+                raise TypeError(
+                    f"Facet filter {value!r} is not a query or iterable of queries"
+                ) from None
+            for q in iterator:
+                self._add_query(queries, q)
+
+    def add_filter(self, facetname, q):
+        """Adds a filter query to the named facet group and returns self."""
+
+        self._add_value(self.filters[facetname], q)
+        return self
+
+    def add_filters(self, filters):
+        """Adds a mapping or iterable of facet filter groups and returns self."""
+
+        if isinstance(filters, FacetFilters):
+            for name, queries in filters.items():
+                self.filters[name].extend(queries)
+            self.required.extend(filters.required)
+        else:
+            if isinstance(filters, dict):
+                items = filters.items()
+            else:
+                items = filters
+
+            for name, value in items:
+                self.add_filter(name, value)
+        return self
+
+    def add_required(self, q):
+        """Adds a mandatory filter query and returns self."""
+
+        self._add_value(self.required, q)
+        return self
+
+    def to_query(self, exclude=None, include_required=True):
+        """Returns a query for the grouped filters.
+
+        :param exclude: optionally omit the filter group belonging to this
+            facet name.
+        :param include_required: whether to include mandatory filters added
+            with :meth:`add_required`.
+        """
+
+        clauses = []
+        if include_required:
+            clauses.extend(self.required)
+
+        for name, queries in self.filters.items():
+            if name == exclude:
+                continue
+            if len(queries) == 1:
+                clauses.append(queries[0])
+            elif queries:
+                clauses.append(query.Or(queries))
+
+        if not clauses:
+            return None
+        return query.And(clauses).normalize()
 
 
 # Objects for holding facet groups

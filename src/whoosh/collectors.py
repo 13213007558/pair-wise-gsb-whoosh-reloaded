@@ -704,8 +704,8 @@ class FilterCollector(WrappingCollector):
         restrict = self.restrict
         ftc = top_searcher._filter_to_comb
 
-        self._allow = ftc(allow) if allow else None
-        self._restrict = ftc(restrict) if restrict else None
+        self._allow = ftc(allow) if allow is not None else None
+        self._restrict = ftc(restrict) if restrict is not None else None
         self.filtered_count = 0
 
     def all_ids(self):
@@ -715,15 +715,15 @@ class FilterCollector(WrappingCollector):
         _restrict = self._restrict
 
         for global_docnum in child.all_ids():
-            if (_allow and global_docnum not in _allow) or (
-                _restrict and global_docnum in _restrict
+            if (_allow is not None and global_docnum not in _allow) or (
+                _restrict is not None and global_docnum in _restrict
             ):
                 continue
             yield global_docnum
 
     def count(self):
         child = self.child
-        if child.computes_count():
+        if self._allow is None and self._restrict is None:
             return child.count()
         else:
             return ilen(self.all_ids())
