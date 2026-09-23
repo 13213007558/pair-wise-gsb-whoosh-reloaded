@@ -81,6 +81,32 @@ class WeightingModel:
 
         return score
 
+    def explain(self, searcher, fieldname, text, docnum, matcher):
+        """Returns a JSON-serializable dictionary of model-specific details
+        about how this model scored the given term in the given document,
+        or None if this model does not support score explanations.
+
+        This is the explanation protocol used by
+        :meth:`whoosh.searching.Searcher.explain`. Custom weighting models
+        can implement this method to provide a breakdown of the score (for
+        example the IDF, average field length, and free parameters used).
+        The generic term statistics (term frequency and document field
+        length) are added by the caller, so this method only needs to
+        provide model-specific values. When this method returns None (the
+        default), the explanation tree marks the term node as
+        ``unsupported`` but still reports the real score.
+
+        :param searcher: :class:`whoosh.searching.Searcher` for the index.
+        :param fieldname: the name of the field being scored.
+        :param text: the term text (as bytes).
+        :param docnum: the document number being explained, in the
+            searcher's global numbering.
+        :param matcher: a :class:`whoosh.matching.Matcher` for the term,
+            positioned on the document.
+        """
+
+        return None
+
 
 class BaseScorer:
     """Base class for "scorer" implementations. A scorer provides a method for
@@ -309,6 +335,26 @@ class BM25F(WeightingModel):
             B = self.B
 
         return BM25FScorer(searcher, fieldname, text, B, self.K1, qf=qf)
+
+    def explain(self, searcher, fieldname, text, docnum, matcher):
+        if not searcher.schema[fieldname].scorable:
+            return None
+
+        if fieldname in self._field_B:
+            B = self._field_B[fieldname]
+        else:
+            B = self.B
+
+        # IDF and average field length are global statistics, so get them
+        # from the top-level searcher, mirroring BM25FScorer
+        parent = searcher.get_parent()
+        return {
+            "model": "BM25F",
+            "idf": parent.idf(fieldname, text),
+            "avg_field_length": parent.avg_field_length(fieldname) or 1,
+            "params": {"B": B, "K1": self.K1},
+            "formula": "idf * (tf * (K1 + 1)) / (tf + K1 * (1 - B + B * fl / avgfl))",
+        }
 
 
 class BM25FScorer(WeightLengthScorer):

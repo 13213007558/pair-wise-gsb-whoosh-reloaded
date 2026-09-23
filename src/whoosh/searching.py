@@ -860,6 +860,88 @@ class Searcher:
 
         collector.run()
 
+    def explain(self, q, docnum, filter=None, mask=None, context=None):
+        """Returns a JSON-serializable dictionary tree explaining how the
+        given query scored (or did not score) the given document. This is a
+        read-only operation: it uses this searcher's snapshot of the index
+        for all statistics, even if the index has been updated since this
+        searcher was created.
+
+        The top-level ``score`` in the returned tree is computed by the
+        same matcher/scorer objects used by :meth:`search` on this
+        searcher, so it is consistent with the score of a real search
+        (within floating point tolerance). Parent nodes in the tree describe
+        how the scores of their children are combined, so the listed
+        contributions can be recombined to recompute the final score.
+
+        If the document does not match the query, is deleted, or is
+        excluded by the given filter/mask, the returned dictionary has
+        ``matched`` set to False, ``score`` set to None, and a
+        ``reason`` key, instead of a normal-looking zero score.
+
+        For a multi-segment index, ``docnum`` is the document number in
+        this searcher's global numbering. The returned dictionary includes
+        ``segment``, ``segment_docnum``, and ``segment_offset``
+        keys mapping the global number back to the segment-local identity.
+
+        :param q: a :class:`whoosh.query.Query` object.
+        :param docnum: the document number to explain, in this searcher's
+            (global) numbering.
+        :param filter: an optional filter (query, Results, or set of
+            docnums), as in :meth:`search`. If the document is not in the
+            filter, the explanation reports it as not matched.
+        :param mask: an optional mask (query, Results, or set of docnums),
+            as in :meth:`search`. If the document is in the mask, the
+            explanation reports it as not matched.
+        :param context: an optional :class:`SearchContext`.
+        :rtype: dict
+        """
+
+        from whoosh.explain import explain_query
+
+        doccount = self.doc_count_all()
+        if not 0 <= docnum < doccount:
+            raise ValueError(f"docnum {docnum} is out of range [0, {doccount})")
+
+        context = context or self.context()
+        reader = self.ixreader
+
+        node = None
+        if reader.is_deleted(docnum):
+            node = {
+                "type": "document",
+                "matched": False,
+                "score": None,
+                "reason": "document is deleted",
+            }
+        elif filter is not None and docnum not in self._filter_to_comb(filter):
+            node = {
+                "type": "document",
+                "matched": False,
+                "score": None,
+                "reason": "document is excluded by the filter",
+            }
+        elif mask is not None and docnum in self._filter_to_comb(mask):
+            node = {
+                "type": "document",
+                "matched": False,
+                "score": None,
+                "reason": "document is excluded by the mask",
+            }
+
+        if node is None:
+            node = explain_query(self, q, docnum, context)
+
+        # Add the document identity, mapping multi-segment local docnums
+        # back to this searcher's global numbering
+        node["docnum"] = docnum
+        if not reader.is_atomic():
+            segnum, segdoc = reader._segment_and_docnum(docnum)
+            node["segment"] = segnum
+            node["segment_docnum"] = segdoc
+            node["segment_offset"] = reader.doc_offsets[segnum]
+        return node
+
     def correct_query(
         self, q, qstring, correctors=None, terms=None, maxdist=2, prefix=0, aliases=None
     ):
