@@ -261,6 +261,49 @@ than strings), you will need to override other methods. See the documentation
 for the :class:` whoosh.highlight.Formatter` class.
 
 
+Highlighting HTML fragments
+===========================
+
+If the stored value is a fragment of HTML, highlighting it as plain text would
+insert markup at raw character offsets, breaking tags and entities such as
+``&amp;``. The :func:`whoosh.highlight.highlight_html` function
+highlights the *visible text* of an HTML fragment instead::
+
+    from whoosh import highlight
+
+    result = highlight.highlight_html("co<strong>de</strong> &amp; data", {"code"})
+    result.visible_text   # "code & data"
+    result.matches        # [(0, 4)]
+    result.html
+    # '<mark>co</mark><strong><mark>de</mark></strong> &amp; data'
+
+Only text nodes are analyzed: tags and attributes never participate in
+matching, and the content of ``script`` and ``style`` elements
+is excluded entirely. Entities are decoded for matching. A term may span
+adjacent inline tags (as above, where the match is split into one element per
+text node) but never crosses a block-level boundary such as a paragraph.
+
+The output is rebuilt from scratch using a whitelist of allowed tags and
+attributes, with all text and attribute values escaped, so untrusted input
+HTML is never echoed back verbatim. URL attributes such as ``href``
+are dropped unless they use a safe scheme (``http``, ``https``,
+``mailto``) or no scheme. You can customize the whitelists and the
+highlight element::
+
+    result = highlight.highlight_html(
+        text, terms,
+        tags={"b", "em"},
+        attributes={"b": {"title"}},
+        mark_tag="span",
+        mark_class="hit",
+    )
+
+The returned :class:`whoosh.highlight.HtmlHighlightResult` object has the
+extracted ``visible_text``, the merged list of ``matches`` as
+``(startchar, endchar)`` ranges into the visible text, and the
+highlighted ``html`` fragment.
+
+
 Highlighter object
 ==================
 

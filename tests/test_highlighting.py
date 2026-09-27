@@ -360,3 +360,125 @@ def test_whole_noterms():
 
         hi = r[0].highlights("text", minscore=0)
         assert hi == "alfa bravo charlie delta echo foxtrot golf"
+
+
+def test_html_fragment_inline_span():
+    # A term spanning adjacent inline tags matches and is split into one
+    # mark per text node; the original tags are preserved
+    result = highlight.highlight_html("co<strong>de</strong> &amp; data", {"code"})
+    assert result.visible_text == "code & data"
+    assert result.matches == [(0, 4)]
+    assert result.html == "<mark>co</mark><strong><mark>de</mark></strong> &amp; data"
+
+
+def test_html_fragment_block_boundary():
+    # A term may not span a block-level boundary
+    result = highlight.highlight_html("<p>co</p><p>de</p>", {"code"})
+    assert result.visible_text == "co\nde\n"
+    assert result.matches == []
+    assert result.html == "<p>co</p><p>de</p>"
+
+    # ...but inline siblings are fine
+    result = highlight.highlight_html("<span>co</span><em>de</em>", {"code"})
+    assert result.visible_text == "code"
+    assert result.matches == [(0, 4)]
+    assert result.html == "<span><mark>co</mark></span><em><mark>de</mark></em>"
+
+
+def test_html_fragment_double_entity():
+    # Entities are decoded exactly once for matching, and the output is
+    # re-escaped
+    result = highlight.highlight_html("fish &amp;amp; chips", {"chips"})
+    assert result.visible_text == "fish &amp; chips"
+    assert result.matches == [(11, 16)]
+    assert result.html == "fish &amp;amp; <mark>chips</mark>"
+
+
+def test_html_fragment_script_style_excluded():
+    # script/style content is neither analyzed nor emitted
+    text = "<script>var code = 1;</script><style>.data {}</style>real code"
+    result = highlight.highlight_html(text, {"code", "data"})
+    assert result.visible_text == "real code"
+    assert result.matches == [(5, 9)]
+    assert result.html == "real <mark>code</mark>"
+
+
+def test_html_fragment_untrusted_input():
+    # Attributes not on the whitelist are dropped, dangerous URL schemes are
+    # removed, and allowed attributes are re-escaped
+    text = (
+        '<a href="javascript:alert(1)" onclick="evil()">click</a> '
+        '<a href="https://example.com/?a=1&amp;b=2" title="safe">ok</a>'
+    )
+    result = highlight.highlight_html(text, {"click", "ok"})
+    assert (
+        result.html == "<a><mark>click</mark></a> "
+        '<a href="https://example.com/?a=1&amp;b=2" title="safe"><mark>ok</mark></a>'
+    )
+
+    # Tags not on the whitelist are dropped but their text is kept
+    result = highlight.highlight_html("<marquee>hi</marquee>", {"hi"})
+    assert result.html == "<mark>hi</mark>"
+
+    # Stray end tags do not leak into the output
+    result = highlight.highlight_html("foo</strong>bar", set())
+    assert result.html == "foobar"
+
+    # Text is escaped even if it looks like markup
+    result = highlight.highlight_html("1 &lt; 2", set())
+    assert result.visible_text == "1 < 2"
+    assert result.html == "1 &lt; 2"
+
+
+def test_html_fragment_whitelist_override():
+    result = highlight.highlight_html(
+        '<b class="x">one</b> <u>two</u>',
+        {"one", "two"},
+        tags={"u"},
+        attributes={},
+    )
+    assert result.html == "<mark>one</mark> <u><mark>two</mark></u>"
+
+
+def test_html_fragment_unicode_combining():
+    # Combining characters are part of the visible text and positions map
+    # back correctly
+    result = highlight.highlight_html("<b>cafe\u0301</b> au lait", {"au"})
+    assert result.visible_text == "cafe\u0301 au lait"
+    assert result.matches == [(6, 8)]
+    assert result.html == "<b>cafe\u0301</b> <mark>au</mark> lait"
+
+
+def test_html_fragment_overlapping_merge():
+    # Overlapping hits are merged deterministically into a single range
+    assert highlight.merge_ranges([(0, 3), (1, 4), (8, 9), (4, 6)]) == [
+        (0, 6),
+        (8, 9),
+    ]
+
+    na = analysis.NgramAnalyzer(3)
+    result = highlight.highlight_html("abcde", {"abc", "bcd"}, analyzer=na)
+    assert result.matches == [(0, 4)]
+    assert result.html == "<mark>abcd</mark>e"
+
+
+def test_html_fragment_mark_options():
+    result = highlight.highlight_html(
+        "alfa bravo", {"bravo"}, mark_tag="em", mark_class='hit "1"'
+    )
+    assert result.html == 'alfa <em class="hit &quot;1&quot;">bravo</em>'
+
+    with pytest.raises(ValueError):
+        highlight.highlight_html("alfa", {"alfa"}, mark_tag="x><script")
+
+
+def test_html_fragment_plaintext_unaffected():
+    # The plain-text pipeline is untouched by the HTML fragment mode
+    terms = frozenset(("bravo",))
+    sa = analysis.StandardAnalyzer()
+    htext = highlight.highlight(
+        _doc, terms, sa, highlight.WholeFragmenter(), highlight.UppercaseFormatter()
+    )
+    assert htext == (
+        "alfa BRAVO charlie delta echo foxtrot golf hotel india juliet kilo lima"
+    )

@@ -48,13 +48,15 @@ The highlighting system has four main elements.
 See :doc:`/highlight` for more information.
 """
 
-
+import re
 from collections import deque
 from heapq import nlargest
 from html import escape as htmlescape
+from html import unescape as htmlunescape
+from html.parser import HTMLParser
 from itertools import groupby
 
-from whoosh.analysis import Token
+from whoosh.analysis import StandardAnalyzer, Token
 
 # The default value for the maximum chars to examine when fragmenting
 DEFAULT_CHARLIMIT = 2**15
@@ -1117,3 +1119,465 @@ class Highlighter:
         )
         output = self.formatter.format(fragments)
         return output
+
+
+# HTML fragment highlighting
+#
+# The functions and classes below implement an "HTML fragment" mode for
+# highlighting. Instead of treating the stored value as plain text (which
+# would break tags and entities such as "&amp;" when inserting highlight
+# markup at raw character offsets), the fragment is parsed into events. Only
+# the visible text nodes are analyzed; hit positions computed on the visible
+# text are mapped back onto the original event stream, and the output is
+# rebuilt from scratch using a caller-supplied whitelist of allowed tags and
+# attributes. The input is never trusted or echoed back verbatim.
+
+# Tags whose content is not visible text and is excluded entirely (neither
+# analyzed nor emitted)
+HTML_SKIP_TAGS = frozenset(["script", "style"])
+
+# Tags that do not have closing tags
+HTML_VOID_TAGS = frozenset(
+    [
+        "area",
+        "base",
+        "br",
+        "col",
+        "embed",
+        "hr",
+        "img",
+        "input",
+        "link",
+        "meta",
+        "param",
+        "source",
+        "track",
+        "wbr",
+    ]
+)
+
+# Tags that break the flow of text: a match may span adjacent inline tags
+# (e.g. "co<strong>de</strong>") but never one of these boundaries
+HTML_BLOCK_TAGS = frozenset(
+    [
+        "address",
+        "article",
+        "aside",
+        "blockquote",
+        "br",
+        "dd",
+        "details",
+        "div",
+        "dl",
+        "dt",
+        "fieldset",
+        "figcaption",
+        "figure",
+        "footer",
+        "form",
+        "h1",
+        "h2",
+        "h3",
+        "h4",
+        "h5",
+        "h6",
+        "header",
+        "hr",
+        "li",
+        "main",
+        "nav",
+        "ol",
+        "p",
+        "pre",
+        "section",
+        "table",
+        "tbody",
+        "td",
+        "tfoot",
+        "th",
+        "thead",
+        "tr",
+        "ul",
+    ]
+)
+
+# Default whitelist of tags preserved in the output. Anything not listed here
+# is dropped (its text content is kept).
+DEFAULT_HTML_FRAGMENT_TAGS = frozenset(
+    [
+        "a",
+        "abbr",
+        "b",
+        "blockquote",
+        "br",
+        "cite",
+        "code",
+        "dd",
+        "del",
+        "dfn",
+        "div",
+        "dl",
+        "dt",
+        "em",
+        "figcaption",
+        "figure",
+        "h1",
+        "h2",
+        "h3",
+        "h4",
+        "h5",
+        "h6",
+        "hr",
+        "i",
+        "ins",
+        "kbd",
+        "li",
+        "mark",
+        "ol",
+        "p",
+        "pre",
+        "q",
+        "s",
+        "samp",
+        "small",
+        "span",
+        "strong",
+        "sub",
+        "sup",
+        "table",
+        "tbody",
+        "td",
+        "th",
+        "thead",
+        "tr",
+        "u",
+        "ul",
+        "var",
+    ]
+)
+
+# Default whitelist of attributes, mapped by tag. The special key "*" applies
+# to every allowed tag.
+DEFAULT_HTML_FRAGMENT_ATTRIBUTES = {
+    "*": frozenset(["title"]),
+    "a": frozenset(["href", "title"]),
+}
+
+# Attributes whose values are URLs and must pass the scheme check
+HTML_URL_ATTRIBUTES = frozenset(["href", "src", "cite", "action"])
+
+# URL schemes considered safe in URL attributes
+HTML_SAFE_URL_SCHEMES = frozenset(["http", "https", "mailto"])
+
+_url_scheme_pat = re.compile(r"^([a-zA-Z][a-zA-Z0-9+.-]*):")
+_tag_name_pat = re.compile(r"^[a-zA-Z][a-zA-Z0-9-]*$")
+
+
+def _is_safe_url(value):
+    # Strip whitespace and control characters browsers would ignore
+    cleaned = "".join(value.split())
+    match = _url_scheme_pat.match(cleaned)
+    if match:
+        return match.group(1).lower() in HTML_SAFE_URL_SCHEMES
+    # No scheme: relative URL, fragment, or protocol-relative URL
+    return True
+
+
+class _HtmlFragmentParser(HTMLParser):
+    """Parses an HTML fragment into a flat list of events while building the
+    visible text (entities decoded, script/style content removed, block
+    boundaries inserted as newlines).
+
+    Events are lists of the form ["start", tag, attrs], ["end", tag],
+    ["void", tag, attrs], or ["text", decoded_text].
+    """
+
+    def __init__(self):
+        super().__init__(convert_charrefs=False)
+        self.events = []
+        self.visible = []
+        self._skip_tag = None
+        self._skip_depth = 0
+
+    def _boundary(self):
+        if self.visible and self.visible[-1] != "\n":
+            self.visible.append("\n")
+
+    def _append_text(self, text):
+        if not text:
+            return
+        if self.events and self.events[-1][0] == "text":
+            self.events[-1][1] += text
+        else:
+            self.events.append(["text", text])
+        self.visible.extend(text)
+
+    def handle_starttag(self, tag, attrs):
+        if self._skip_depth:
+            if tag == self._skip_tag:
+                self._skip_depth += 1
+            return
+        if tag in HTML_SKIP_TAGS:
+            self._skip_tag = tag
+            self._skip_depth = 1
+            return
+        if tag in HTML_BLOCK_TAGS:
+            self._boundary()
+        if tag in HTML_VOID_TAGS:
+            self.events.append(["void", tag, attrs])
+            if tag in HTML_BLOCK_TAGS:
+                self._boundary()
+        else:
+            self.events.append(["start", tag, attrs])
+
+    def handle_startendtag(self, tag, attrs):
+        if self._skip_depth or tag in HTML_SKIP_TAGS:
+            return
+        if tag in HTML_BLOCK_TAGS:
+            self._boundary()
+        self.events.append(["void", tag, attrs])
+        if tag in HTML_BLOCK_TAGS:
+            self._boundary()
+
+    def handle_endtag(self, tag):
+        if self._skip_depth:
+            if tag == self._skip_tag:
+                self._skip_depth -= 1
+                if not self._skip_depth:
+                    self._skip_tag = None
+            return
+        if tag in HTML_SKIP_TAGS or tag in HTML_VOID_TAGS:
+            return
+        if tag in HTML_BLOCK_TAGS:
+            self._boundary()
+        self.events.append(["end", tag])
+
+    def handle_data(self, data):
+        if not self._skip_depth:
+            self._append_text(data)
+
+    def handle_entityref(self, name):
+        if not self._skip_depth:
+            self._append_text(htmlunescape("&%s;" % name))
+
+    def handle_charref(self, name):
+        if not self._skip_depth:
+            self._append_text(htmlunescape("&#%s;" % name))
+
+
+def merge_ranges(ranges):
+    """Deterministically merges overlapping or directly adjacent (start, end)
+    ranges: ranges are sorted by (start, end) and any range that starts at or
+    before the end of the previous one is folded into it. Returns a list of
+    (start, end) tuples.
+    """
+
+    merged = []
+    for start, end in sorted(ranges):
+        if end <= start:
+            continue
+        if merged and start <= merged[-1][1]:
+            if end > merged[-1][1]:
+                merged[-1][1] = end
+        else:
+            merged.append([start, end])
+    return [(start, end) for start, end in merged]
+
+
+class HtmlHighlightResult:
+    """The result of :func:highlight_html.
+
+    visible_text
+        The text extracted from the HTML fragment (entities decoded,
+        script/style content removed, block boundaries as newlines). This is
+        the text the analyzer saw.
+
+    matches
+        A list of (startchar, endchar) tuples into visible_text, merged so
+        they never overlap.
+
+    html
+        The highlighted HTML fragment, rebuilt using the tag/attribute
+        whitelist with all text and attribute values escaped.
+    """
+
+    def __init__(self, visible_text, matches, html):
+        self.visible_text = visible_text
+        self.matches = matches
+        self.html = html
+
+    def __str__(self):
+        return self.html
+
+    def __repr__(self):
+        return "%s(%r, %r)" % (
+            self.__class__.__name__,
+            self.visible_text,
+            self.matches,
+        )
+
+
+def _render_html_attrs(tag, attrs, attributes):
+    allowed = set(attributes.get("*", ()))
+    allowed |= set(attributes.get(tag, ()))
+    parts = []
+    seen = set()
+    for name, value in attrs:
+        if not name:
+            continue
+        name = name.lower()
+        if name in seen or name not in allowed:
+            continue
+        seen.add(name)
+        if value is None:
+            value = ""
+        if name in HTML_URL_ATTRIBUTES and not _is_safe_url(value):
+            continue
+        parts.append(' %s="%s"' % (name, htmlescape(value, quote=True)))
+    return "".join(parts)
+
+
+def _render_html_fragment(events, matches, tags, attributes, mark_open, mark_close):
+    output = []
+    stack = []
+    visible_index = 0
+    match_index = 0
+
+    for event in events:
+        kind = event[0]
+        if kind == "text":
+            run = event[1]
+            run_start = visible_index
+            run_end = run_start + len(run)
+            visible_index = run_end
+
+            # Advance past matches that end before this run
+            while match_index < len(matches) and matches[match_index][1] <= run_start:
+                match_index += 1
+
+            cursor = 0
+            index = match_index
+            while index < len(matches) and matches[index][0] < run_end:
+                start, end = matches[index]
+                index += 1
+                if end <= run_start:
+                    continue
+                local_start = max(start, run_start) - run_start
+                local_end = min(end, run_end) - run_start
+                if local_start > cursor:
+                    output.append(htmlescape(run[cursor:local_start], quote=False))
+                output.append(mark_open)
+                output.append(htmlescape(run[local_start:local_end], quote=False))
+                output.append(mark_close)
+                cursor = local_end
+            if cursor < len(run):
+                output.append(htmlescape(run[cursor:], quote=False))
+        elif kind == "start":
+            tag = event[1]
+            if tag in tags:
+                output.append(
+                    "<%s%s>" % (tag, _render_html_attrs(tag, event[2], attributes))
+                )
+                stack.append(tag)
+        elif kind == "void":
+            tag = event[1]
+            if tag in tags:
+                attr_string = _render_html_attrs(tag, event[2], attributes)
+                if tag in HTML_VOID_TAGS:
+                    output.append("<%s%s>" % (tag, attr_string))
+                else:
+                    output.append("<%s%s></%s>" % (tag, attr_string, tag))
+        else:  # "end"
+            tag = event[1]
+            if tag in stack:
+                # Close any tags still open inside this one to keep the
+                # output well-formed, then close the tag itself
+                while stack:
+                    open_tag = stack.pop()
+                    output.append("</%s>" % open_tag)
+                    if open_tag == tag:
+                        break
+
+    while stack:
+        output.append("</%s>" % stack.pop())
+
+    return "".join(output)
+
+
+def highlight_html(
+    text,
+    terms,
+    analyzer=None,
+    tags=None,
+    attributes=None,
+    mark_tag="mark",
+    mark_class=None,
+    mode="query",
+):
+    """Highlights query terms in a fragment of HTML.
+
+    Only the visible text nodes of the fragment are analyzed: tags and
+    attributes never participate in matching, and the content of script and
+    style elements is excluded entirely. Entities are decoded for matching
+    ("&amp;" is one visible character). A term may span adjacent inline tags
+    ("co<strong>de</strong>" matches "code", producing one highlight element
+    per text node) but never crosses a block-level boundary such as a
+    paragraph.
+
+    The output is rebuilt using only the whitelisted tags and attributes,
+    with all text and attribute values escaped, so the input HTML is never
+    trusted. URL attributes (href etc.) are dropped unless they use a safe
+    scheme (http, https, mailto) or no scheme.
+
+    :param text: the HTML fragment to highlight.
+    :param terms: a collection of term strings to highlight (matched against
+        the analyzed token texts, as with :func:highlight).
+    :param analyzer: the analyzer to tokenize the visible text with. If None,
+        a whoosh.analysis.StandardAnalyzer is used.
+    :param tags: the set of tag names allowed in the output. Defaults to
+        DEFAULT_HTML_FRAGMENT_TAGS.
+    :param attributes: a dict mapping tag names to sets of allowed attribute
+        names (the key "*" applies to all tags). Defaults to
+        DEFAULT_HTML_FRAGMENT_ATTRIBUTES.
+    :param mark_tag: the tag name to wrap matches with.
+    :param mark_class: an optional class name to add to the match elements.
+    :param mode: the analyzer mode (as in :func:highlight).
+    :returns: an HtmlHighlightResult with the visible text, the merged match
+        ranges in the visible text, and the highlighted HTML fragment.
+    """
+
+    if analyzer is None:
+        analyzer = StandardAnalyzer()
+    if tags is None:
+        tags = DEFAULT_HTML_FRAGMENT_TAGS
+    if attributes is None:
+        attributes = DEFAULT_HTML_FRAGMENT_ATTRIBUTES
+    if not _tag_name_pat.match(mark_tag):
+        raise ValueError("Invalid mark tag name: %r" % mark_tag)
+
+    parser = _HtmlFragmentParser()
+    parser.feed(text)
+    parser.close()
+
+    visible_text = "".join(parser.visible)
+    termset = frozenset(terms)
+    tokens = analyzer(visible_text, chars=True, mode=mode, removestops=False)
+    matches = merge_ranges(
+        (t.startchar, t.endchar)
+        for t in set_matched_filter(tokens, termset)
+        if t.matched
+    )
+
+    if mark_class is not None:
+        mark_open = '<%s class="%s">' % (
+            mark_tag,
+            htmlescape(mark_class, quote=True),
+        )
+    else:
+        mark_open = "<%s>" % mark_tag
+    mark_close = "</%s>" % mark_tag
+
+    html = _render_html_fragment(
+        parser.events, matches, tags, attributes, mark_open, mark_close
+    )
+    return HtmlHighlightResult(visible_text, matches, html)
