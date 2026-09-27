@@ -15,6 +15,11 @@ Manual highlighting
 
 .. autofunction:: highlight
 
+.. autofunction:: highlight_html
+
+.. autoclass:: HtmlHighlightResult
+   :members:
+
 
 Fragmenters
 ===========
@@ -41,6 +46,7 @@ Formatters
 .. autoclass:: UppercaseFormatter
 .. autoclass:: HtmlFormatter
 .. autoclass:: GenshiFormatter
+.. autoclass:: HtmlFragmentFormatter
 
 
 Utility classes

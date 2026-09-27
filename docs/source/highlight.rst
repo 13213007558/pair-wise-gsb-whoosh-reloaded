@@ -282,6 +282,39 @@ or ``formatter`` attributes, you're actually changing the values on the
 results object's default ``Highlighter`` object.)
 
 
+Highlighting HTML fragments
+============================
+
+Sometimes the stored text is a fragment of HTML rather than plain text.
+Highlighting it as plain text would split tags or entity references (for
+example ``&amp;``) apart. The :func:` whoosh.highlight.highlight_html`
+function is an HTML-aware version of :func:` whoosh.highlight.highlight`::
+
+    sa = analysis.StandardAnalyzer()
+    r = highlight.highlight_html("co<strong>de</strong> &amp; data", ["code"], sa)
+    print(r.text)     # the visible text: "code & data"
+    print(r.matches)  # hit ranges in the visible text: [(0, 4)]
+    print(r.html)     # highlighted HTML fragment
+
+In HTML fragment mode:
+
+* Only visible text nodes are analyzed. Tags and attributes never
+  participate in matching, entity references are understood as the text
+  they represent, and the contents of ``script`` and ``style`` elements are
+  excluded entirely.
+
+* A term may span adjacent inline tags (``co<strong>de</strong>`` matches
+  ``code``) but never a block-level boundary such as ``</p>``. A match that
+  crosses an inline tag is split into one highlight element per text run,
+  so the original links and emphasis are preserved.
+
+* The output is rebuilt from scratch using a whitelist of allowed tags and
+  attributes (see :class:` whoosh.highlight.HtmlFragmentFormatter`). All
+  text and attribute values are escaped and URL attributes with unsafe
+  schemes are dropped, so the input HTML is never trusted verbatim.
+
+* Overlapping hits are merged into a single highlight element.
+
 Speeding up highlighting
 ========================
 

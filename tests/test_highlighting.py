@@ -2,6 +2,7 @@ import pytest
 
 # from jieba.analyse import ChineseAnalyzer
 from whoosh import analysis, fields, highlight, qparser, query
+from whoosh.analysis import Token
 from whoosh.filedb.filestore import RamStorage
 from whoosh.util.testing import TempIndex
 
@@ -360,3 +361,159 @@ def test_whole_noterms():
 
         hi = r[0].highlights("text", minscore=0)
         assert hi == "alfa bravo charlie delta echo foxtrot golf"
+
+
+def test_html_fragment_inline_tags():
+    # A term may span adjacent inline tags; the hit is split into one
+    # element per text run and the original tags are preserved
+    sa = analysis.StandardAnalyzer()
+    r = highlight.highlight_html("co<strong>de</strong> &amp; data", ["code"], sa)
+    assert r.text == "code & data"
+    assert r.matches == [(0, 4)]
+    assert r.html == (
+        '<mark class="match">co</mark><strong><mark class="match">de</mark>'
+        "</strong> &amp; data"
+    )
+
+
+def test_html_fragment_result_str():
+    sa = analysis.StandardAnalyzer()
+    r = highlight.highlight_html("alfa bravo", ["bravo"], sa)
+    assert r.text == "alfa bravo"
+    assert r.matches == [(5, 10)]
+    assert str(r) == r.html
+    assert r == 'alfa <mark class="match">bravo</mark>'
+
+
+def test_html_fragment_malicious_attributes():
+    sa = analysis.StandardAnalyzer()
+    html = (
+        '<a href="javascript:alert(1)" onclick="steal()">alfa</a> '
+        '<b onmouseover="x()">bravo</b>'
+    )
+    r = highlight.highlight_html(html, ["alfa", "bravo"], sa)
+    # Unsafe URL scheme and non-whitelisted attributes are dropped
+    assert r.html == (
+        '<a><mark class="match">alfa</mark></a> <b><mark class="match">bravo</mark></b>'
+    )
+
+
+def test_html_fragment_attribute_escaping():
+    sa = analysis.StandardAnalyzer()
+    html = '<a href="https://example.com/?a=1&amp;b=2" title=\'x" y\'>alfa</a>'
+    r = highlight.highlight_html(html, ["alfa"], sa)
+    # Safe href is kept, values are re-escaped
+    assert r.html == (
+        '<a href="https://example.com/?a=1&amp;b=2" title="x&quot; y">'
+        '<mark class="match">alfa</mark></a>'
+    )
+
+
+def test_html_fragment_double_entity():
+    sa = analysis.StandardAnalyzer()
+    r = highlight.highlight_html("alfa &amp;amp; bravo", ["bravo"], sa)
+    # One decoding pass: the visible text contains the literal "&amp;"
+    assert r.text == "alfa &amp; bravo"
+    assert r.matches == [(11, 16)]
+    assert r.html == 'alfa &amp;amp; <mark class="match">bravo</mark>'
+
+
+def test_html_fragment_combining_chars():
+    sa = analysis.StandardAnalyzer()
+    r = highlight.highlight_html("cafe\u0301 au lait", ["cafe"], sa)
+    assert r.text == "cafe\u0301 au lait"
+    # The match covers the base letters; the combining mark stays outside
+    assert r.matches == [(0, 4)]
+    assert r.html == '<mark class="match">cafe</mark>\u0301 au lait'
+
+
+def test_html_fragment_script_style():
+    sa = analysis.StandardAnalyzer()
+    html = (
+        "<script>var alfa = 1;</script>alfa "
+        "<style>.alfa { color: red }</style><b>bravo</b>"
+    )
+    r = highlight.highlight_html(html, ["alfa", "bravo"], sa)
+    # script/style contents are excluded from the visible text and output
+    assert r.text == "alfa bravo"
+    assert r.matches == [(0, 4), (5, 10)]
+    assert r.html == (
+        '<mark class="match">alfa</mark> <b><mark class="match">bravo</mark></b>'
+    )
+
+
+def test_html_fragment_block_boundary():
+    sa = analysis.StandardAnalyzer()
+    r = highlight.highlight_html("<p>alfa</p><p>bravo</p>", ["alfa", "bravo"], sa)
+    # A newline separates the paragraphs so matches cannot span them
+    assert r.text == "alfa\nbravo"
+    assert r.matches == [(0, 4), (5, 10)]
+    assert r.html == (
+        '<p><mark class="match">alfa</mark></p>\n'
+        '<p><mark class="match">bravo</mark></p>'
+    )
+    # "alfabravo" is not a token because of the paragraph boundary
+    r = highlight.highlight_html("<p>alfa</p><p>bravo</p>", ["alfabravo"], sa)
+    assert r.matches == []
+    assert r.html == ""
+
+
+def test_html_fragment_overlap_merge():
+    # Overlapping matches are merged deterministically into one element
+    frag = highlight.Fragment(
+        "alfa bravo",
+        [
+            Token(text="alfa", startchar=0, endchar=7),
+            Token(text="bravo", startchar=5, endchar=10),
+        ],
+        0,
+        11,
+    )
+    fmt = highlight.HtmlFragmentFormatter()
+    assert fmt.format([frag]) == '<mark class="match">alfa bravo</mark>'
+
+
+def test_html_fragment_whitelist():
+    sa = analysis.StandardAnalyzer()
+    # Tags not on the whitelist are dropped but their text is kept
+    r = highlight.highlight_html(
+        "<marquee>alfa</marquee> <i>bravo</i>",
+        ["alfa", "bravo"],
+        sa,
+        formatter=highlight.HtmlFragmentFormatter(allowed_tags=["i"]),
+    )
+    assert r.html == (
+        '<mark class="match">alfa</mark> <i><mark class="match">bravo</mark></i>'
+    )
+
+
+def test_html_fragment_unclosed_and_escaped():
+    sa = analysis.StandardAnalyzer()
+    # Unclosed tags are closed at the end of the fragment; stray markup
+    # characters in the text are escaped
+    r = highlight.highlight_html("<b>1 < 2 & alfa", ["alfa"], sa)
+    assert r.text == "1 < 2 & alfa"
+    assert r.html == '<b>1 &lt; 2 &amp; <mark class="match">alfa</mark></b>'
+
+
+def test_html_fragment_context_window():
+    sa = analysis.StandardAnalyzer()
+    html = "zero one <em>two three four five six</em> seven eight nine ten"
+    r = highlight.highlight_html(
+        html, ["six"], sa, fragmenter=highlight.ContextFragmenter(surround=10)
+    )
+    # Tags enclosing the start of the window are re-opened and re-closed
+    assert r.html == '<em>four five <mark class="match">six</mark></em> seven eight'
+
+
+def test_html_fragment_plain_highlight_unaffected():
+    # The plain-text highlighting pipeline is unchanged
+    terms = frozenset(("bravo", "india"))
+    sa = analysis.StandardAnalyzer()
+    cf = highlight.ContextFragmenter(surround=6)
+    hf = highlight.HtmlFormatter()
+    htext = highlight.highlight(_doc, terms, sa, cf, hf)
+    assert (
+        htext == 'alfa <strong class="match term0">bravo</strong> charlie...'
+        'hotel <strong class="match term1">india</strong> juliet'
+    )
